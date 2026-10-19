@@ -4,6 +4,12 @@ py_test_deps = [
 ]
 
 py_test(
+    name = "indexer_tensor_capture_test",
+    srcs = ["indexer_tensor_capture_test.py"],
+    deps = py_test_deps,
+)
+
+py_test(
     name = "launch_fusion_benchmark_test",
     srcs = ["launch_fusion_benchmark_test.py"],
     deps = py_test_deps,

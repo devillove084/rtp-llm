@@ -94,6 +94,8 @@ public:
     RecordedBatch(const RecordedBatch&)                              = delete;
     RecordedBatch&                   operator=(const RecordedBatch&) = delete;
     void                            markTimingError() noexcept;
+    // Independent immutable metadata for this forward; excludes mutable token timings.
+    std::string                     tensorCaptureContextJson() const;
     std::vector<RecordedTokenTiming> timings;
 
 private:

@@ -106,6 +106,7 @@ private:
     WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector> wall_tps_reporter_;
     bool enable_ffn_disaggregate_ = false;
     bool enable_detail_log_       = false;
+    bool tensor_capture_enabled_ = false;
 
     bool                  is_propose_          = false;
     int                   propose_model_index_ = 0;

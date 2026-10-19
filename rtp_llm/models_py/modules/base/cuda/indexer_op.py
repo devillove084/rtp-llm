@@ -1,5 +1,6 @@
 """CUDA-specific indexer operations for DeepSeek-V3.2 DSA mechanism."""
 
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
@@ -28,6 +29,24 @@ except Exception as e:
 
 
 _persistent_topk_workspace: Dict[torch.device, torch.Tensor] = {}
+_logger = logging.getLogger(__name__)
+
+
+def _note_tensor_capture_skip(context: Any, reason: str, layer: Optional[int]) -> None:
+    if context is not None:
+        try:
+            context.note_skip(reason, layer=layer)
+        except Exception:
+            _logger.warning(
+                "Indexer tensor capture skip reporting failed", exc_info=True
+            )
+
+
+def _cancel_topk_capture(token: Any, reason: str) -> None:
+    try:
+        token.cancel(reason=reason)
+    except Exception:
+        _logger.warning("Indexer tensor capture cancellation failed", exc_info=True)
 
 
 def _get_topk_workspace(device: torch.device) -> torch.Tensor:
@@ -227,6 +246,7 @@ class IndexerOp(nn.Module):
         block_size: int = 128,
         scale_fmt: str = "ue8m0",
         is_neox_style: bool = True,
+        layer_idx: Optional[int] = None,
     ):
         """
         Initialize IndexerOp.
@@ -240,6 +260,7 @@ class IndexerOp(nn.Module):
             blocksize: Page size (default: 64)
             block_size: Quantization block size (default: 128)
             scale_fmt: FP8 quantization format (default: "ue8m0")
+            layer_idx: Logical layer for tensor capture; None disables capture.
         """
         super().__init__()
         self.index_n_heads = index_n_heads
@@ -251,6 +272,7 @@ class IndexerOp(nn.Module):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
+        self.layer_idx = layer_idx
 
         glm5_topk_backend = (
             os.environ.get("GLM5_INDEXER_TOPK_BACKEND", "dsv4_persistent")
@@ -281,6 +303,54 @@ class IndexerOp(nn.Module):
             )
         self._prefill_topk_backend = prefill_topk_backend
 
+    def _begin_topk_capture(
+        self,
+        context: Any,
+        logits: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        parameters: Dict[str, Any],
+        query_row_start: int,
+        total_query_rows: Optional[int],
+    ) -> Any:
+        try:
+            # The context belongs to a local eager execution, not to this module.
+            # Also reject warmup/capture forwards even if a caller leaked a context.
+            from rtp_llm.ops.compute_ops import (
+                cuda_graph_capture_forward_enabled,
+                cuda_graph_warmup_forward_enabled,
+            )
+
+            reason = None
+            if self.layer_idx is None:
+                reason = "missing_layer"
+            elif total_query_rows is None:
+                reason = "missing_row_mapping"
+            elif cuda_graph_warmup_forward_enabled():
+                reason = "warmup"
+            elif cuda_graph_capture_forward_enabled() or (
+                logits.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                reason = "graph"
+            if reason is not None:
+                _note_tensor_capture_skip(context, reason, self.layer_idx)
+                return None
+            return context.begin_topk(
+                layer=self.layer_idx,
+                logits=logits,
+                row_starts=row_starts,
+                row_ends=row_ends,
+                k=self.index_topk,
+                backend=self._prefill_topk_backend,
+                parameters=parameters,
+                query_row_start=query_row_start,
+                total_query_rows=total_query_rows,
+            )
+        except Exception:
+            _logger.warning("Indexer tensor capture begin failed", exc_info=True)
+            _note_tensor_capture_skip(context, "capture_error", self.layer_idx)
+            return None
+
     def _run_prefill_topk(
         self,
         logits: torch.Tensor,
@@ -288,28 +358,72 @@ class IndexerOp(nn.Module):
         row_ends: torch.Tensor,
         output: torch.Tensor,
         max_seq_len: int,
+        *,
+        context: Any = None,
+        query_row_start: int = 0,
+        total_query_rows: Optional[int] = None,
     ) -> None:
-        if self._prefill_topk_backend == "topk_v3_tie_break":
-            rtp_llm_ops.topk_v3_tie_break(
+        use_v3 = self._prefill_topk_backend == "topk_v3_tie_break"
+        if use_v3:
+            max_seq_len = min(max(int(max_seq_len), 1), logits.shape[1])
+        else:
+            num_rows = logits.shape[0]
+            stride0, stride1 = logits.stride(0), logits.stride(1)
+            force_radix_sort = _fp8_prefill_topk_force_radix_sort()
+
+        token = None
+        if context is not None:
+            parameters = (
+                {
+                    "max_seq_len": max_seq_len,
+                    "stride0": logits.stride(0),
+                    "stride1": logits.stride(1),
+                }
+                if use_v3
+                else {
+                    "num_rows": num_rows,
+                    "stride0": stride0,
+                    "stride1": stride1,
+                    "force_radix_sort": force_radix_sort,
+                }
+            )
+            token = self._begin_topk_capture(
+                context,
                 logits,
                 row_starts,
                 row_ends,
-                output,
-                self.index_topk,
-                min(max(int(max_seq_len), 1), logits.shape[1]),
+                parameters,
+                query_row_start,
+                total_query_rows,
             )
-            return
-        rtp_llm_ops.dsv4_top_k_per_row_prefill(
-            logits,
-            row_starts,
-            row_ends,
-            output,
-            logits.shape[0],
-            logits.stride(0),
-            logits.stride(1),
-            self.index_topk,
-            _fp8_prefill_topk_force_radix_sort(),
-        )
+        try:
+            if use_v3:
+                rtp_llm_ops.topk_v3_tie_break(
+                    logits, row_starts, row_ends, output, self.index_topk, max_seq_len
+                )
+            else:
+                rtp_llm_ops.dsv4_top_k_per_row_prefill(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    output,
+                    num_rows,
+                    stride0,
+                    stride1,
+                    self.index_topk,
+                    force_radix_sort,
+                )
+        except BaseException:
+            if token is not None:
+                _cancel_topk_capture(token, "kernel_error")
+            raise
+        if token is not None:
+            try:
+                token.finish(output)
+            except Exception:
+                _logger.warning("Indexer tensor capture finish failed", exc_info=True)
+                _cancel_topk_capture(token, "capture_error")
+                _note_tensor_capture_skip(context, "capture_error", self.layer_idx)
 
     def _head_dim_with_sf(self) -> int:
         return self.index_head_dim + self.index_head_dim // self.block_size * 4
@@ -723,6 +837,11 @@ class IndexerOp(nn.Module):
         Returns:
             TopK indices tensor
         """
+        _note_tensor_capture_skip(
+            getattr(attention_inputs, "tensor_capture_context", None),
+            "paged",
+            self.layer_idx,
+        )
         weights = weights.view(-1, self.index_n_heads)
         is_target_verify = bool(getattr(attention_inputs, "is_target_verify", False))
         is_draft_extend = bool(getattr(attention_inputs, "is_draft_extend", False))
@@ -840,6 +959,34 @@ class IndexerOp(nn.Module):
             "not CUDA-graph safe"
         )
 
+        context = getattr(attention_inputs, "tensor_capture_context", None)
+        if context is not None:
+            # Owner, pure-prefill and microbatch eligibility come from the frozen
+            # execution context. Never reconstruct that identity from GPU metadata.
+            try:
+                reason = None
+                if (
+                    getattr(attention_inputs, "is_cuda_graph", False)
+                    or getattr(attention_inputs, "prefill_cuda_graph_copy_params", None)
+                    is not None
+                ):
+                    reason = "graph"
+                elif (
+                    getattr(attention_inputs, "context_parallel_info", None) is not None
+                ):
+                    reason = "cp"
+                elif not getattr(attention_inputs, "is_prefill", False):
+                    reason = "decode"
+                if reason is not None:
+                    _note_tensor_capture_skip(context, reason, self.layer_idx)
+                    context = None
+            except Exception:
+                _logger.warning(
+                    "Indexer tensor capture eligibility failed", exc_info=True
+                )
+                _note_tensor_capture_skip(context, "capture_error", self.layer_idx)
+                context = None
+
         # Gather quantized key from cache for prefill.
         # total_kv_tokens = sum(input_lengths + prefix_lengths) across all
         # requests — this is the number of K rows that
@@ -880,6 +1027,7 @@ class IndexerOp(nn.Module):
             (num_rows, self.index_topk), dtype=torch.int32, device=q_fp8.device
         )
         if num_rows == 0:
+            _note_tensor_capture_skip(context, "empty", self.layer_idx)
             return topk_result
         chunk_rows_env = _fp8_mqa_logits_chunk_rows()
         chunk_rows = num_rows if chunk_rows_env <= 0 else min(chunk_rows_env, num_rows)
@@ -906,6 +1054,9 @@ class IndexerOp(nn.Module):
                 fmha_params.ke[row_start:row_end],
                 topk_part,
                 prefill_max_kv_len,
+                context=context,
+                query_row_start=row_start,
+                total_query_rows=num_rows,
             )
             _write_prefill_topk(
                 topk_part,
@@ -970,6 +1121,11 @@ class IndexerOp(nn.Module):
             ``None`` so shared DSA layers can keep propagating the last full
             layer's top-k object.
         """
+        _note_tensor_capture_skip(
+            getattr(attention_inputs, "tensor_capture_context", None),
+            "cp",
+            self.layer_idx,
+        )
         device = q_fp8.device
         has_local_ids = total_local_ids is not None and int(total_local_ids.numel()) > 0
         sharded_cp_kv = kv_cache_sharded and int(cp_size) > 1

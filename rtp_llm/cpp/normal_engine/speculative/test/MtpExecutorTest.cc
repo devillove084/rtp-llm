@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <memory>
 #include <chrono>
+#include <fstream>
+#include <unistd.h>
+#include <pybind11/embed.h>
 #include "torch/all.h"
 #include "autil/EnvUtil.h"
 #include "gtest/gtest.h"
@@ -38,6 +41,8 @@ struct MtpExecutorTestConfig {
     size_t num_layers          = 1;
     size_t gen_num_per_cycle   = 4;
     size_t vocab_size_override = 0;  // 0 means use vocab_size
+    std::string tensor_capture_config;
+    std::string draft_tensor_capture_config;
 };
 
 template<typename T>
@@ -424,6 +429,7 @@ public:
 
         EngineInitParams params = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
         params.sp_config        = sp_config;
+        params.profiling_debug_logging_config.tensor_capture_config = test_config.tensor_capture_config;
         if (test_config.vocab_size_override > 0) {
             params.model_config_.vocab_size = test_config.vocab_size_override;
         }
@@ -432,6 +438,7 @@ public:
         auto mtp_model_params   = std::make_unique<std::vector<std::unique_ptr<EngineInitParams>>>();
         auto mtp_params         = std::make_unique<EngineInitParams>(params);
         mtp_params->py_sp_model = py::none();
+        mtp_params->profiling_debug_logging_config.tensor_capture_config = test_config.draft_tensor_capture_config;
 
         mtp_model_params->push_back(std::move(mtp_params));
 
@@ -509,6 +516,42 @@ public:
         return output;
     }
 };
+
+TEST_F(MtpExecutorTest, testTensorCaptureRejectsEnabledTargetOrDraft) {
+    if (!Py_IsInitialized()) {
+        py::initialize_interpreter();
+    }
+    char directory[] = "/tmp/rtp-mtp-capture-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    const std::string path = std::string(directory) + "/capture.json";
+    {
+        std::ofstream file(path);
+        ASSERT_TRUE(file.good());
+        file << R"({"enabled":true,"authorized_capture":true,"layers":[0],"ops":["indexer.topk"],
+                    "phases":["prefill"],"rank_filter":"record_owner","max_calls":1,
+                    "max_bundle_bytes":1024,"max_total_bytes":1024,"max_inflight_bytes":4096})";
+    }
+    for (bool draft : {false, true}) {
+        MtpExecutorTestConfig config;
+        (draft ? config.draft_tensor_capture_config : config.tensor_capture_config) = path;
+        try {
+            auto components = createMtpExecutorComponents(config);
+            FAIL() << "enabled tensor capture must be rejected by MTP";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("tensor capture is not supported by MtpExecutor"), std::string::npos);
+        }
+    }
+    {
+        std::ofstream file(path);
+        file << R"({"enabled":false})";
+    }
+    autil::EnvGuard record_dir("RTP_LLM_RECORD_DIR", "");
+    autil::EnvGuard record_session("RTP_LLM_RECORD_SESSION", "");
+    MtpExecutorTestConfig disabled;
+    disabled.tensor_capture_config = path;
+    disabled.draft_tensor_capture_config = path;
+    EXPECT_NO_THROW(createMtpExecutorComponents(disabled));
+}
 
 TEST_F(MtpExecutorTest, testDeterministicDraftSamplerReportsPointMassProposal) {
     auto identity_map = torch::arange(4, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));

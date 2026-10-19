@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <mutex>
 #include <vector>
 #include <algorithm>
@@ -110,6 +111,94 @@ torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tenso
     return cuda_tensor;
 }
 
+bool PyWrappedModel::tensorCaptureConfigEnabled(const std::string& config_path) {
+    if (config_path.empty()) {
+        return false;
+    }
+    if (!Py_IsInitialized()) {
+        throw std::runtime_error("tensor capture configuration requires an initialized Python interpreter");
+    }
+    py::gil_scoped_acquire gil;
+    return py::module_::import("rtp_llm.utils.tensor_capture").attr("config_enabled")(config_path).cast<bool>();
+}
+
+void PyWrappedModel::closeTensorCaptureRecorder(py::object& recorder) noexcept {
+    if (!recorder) {
+        return;
+    }
+    // Clear the member before calling Python so every exit path releases it with the GIL held.
+    auto owned = std::move(recorder);
+    try {
+        if (!owned.attr("close")(py::arg("timeout") = 5.0).cast<bool>()) {
+            RTP_LLM_LOG_WARNING("Tensor capture recorder did not finish within the close timeout");
+        }
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_WARNING("Tensor capture recorder close failed: %s", e.what());
+    } catch (...) {
+        RTP_LLM_LOG_WARNING("Tensor capture recorder close failed with an unknown exception");
+    }
+}
+
+void PyWrappedModel::noteTensorCaptureSkip(const char* reason) {
+    if (!tensor_capture_recorder_) {
+        return;
+    }
+    py::gil_scoped_acquire gil;
+    try {
+        tensor_capture_recorder_.attr("note_skip")(reason);
+    } catch (const std::exception& e) {
+        if (!tensor_capture_error_reported_) {
+            tensor_capture_error_reported_ = true;
+            RTP_LLM_LOG_WARNING("Tensor capture skip reporting failed: %s", e.what());
+        }
+    }
+}
+
+void PyWrappedModel::prepareTensorCaptureContext(const GptModelInputs& inputs,
+                                                torch_ext::PyAttentionInputs& attention_inputs) {
+    if (!tensor_capture_recorder_) {
+        return;
+    }
+    const char* reason = nullptr;
+    if (inputs.warmup || cudaGraphWarmupForwardEnabled()) {
+        reason = "warmup";
+    } else if (cudaGraphCaptureForwardEnabled() || attention_inputs.is_cuda_graph) {
+        reason = "graph";
+    } else if (device_props_.enable_prefill_cp || attention_inputs.context_parallel_info.has_value()) {
+        reason = "cp";
+    } else if (inputs.is_target_verify) {
+        reason = "verify";
+    } else if (inputs.is_draft_extend) {
+        reason = "draft";
+    } else if (inputs.is_fake_stream) {
+        reason = "fake";
+    } else if (!attention_inputs.is_prefill || inputs.sequence_lengths.numel() != 0) {
+        reason = "decode";
+    } else if (device_props_.tp_rank != 0) {
+        reason = "non_owner";
+    } else if (inputs.input_lengths.numel() == 0 || inputs.combo_tokens.numel() == 0) {
+        reason = "empty";
+    } else if (inputs.tensor_capture_context_json.empty()) {
+        reason = "missing_context";
+    }
+    if (reason) {
+        noteTensorCaptureSkip(reason);
+        return;
+    }
+    // Called with the GIL held, on a local eager input only. Python validates
+    // every frozen request row (including fake/missing identities) before selection.
+    try {
+        attention_inputs.tensor_capture_context =
+            tensor_capture_recorder_.attr("for_execution")(inputs.tensor_capture_context_json);
+    } catch (const std::exception& e) {
+        if (!tensor_capture_error_reported_) {
+            tensor_capture_error_reported_ = true;
+            RTP_LLM_LOG_WARNING("Tensor capture context creation failed: %s", e.what());
+        }
+        noteTensorCaptureSkip("context_error");
+    }
+}
+
 void PyWrappedModel::releaseBuffers() {
     if (held_attn_pyobj_.ptr()) {
         py::gil_scoped_acquire gil;
@@ -183,6 +272,7 @@ torch::Tensor PyWrappedModel::getPythonDebugKvCache(int64_t layer_idx, int64_t m
 PyWrappedModel::~PyWrappedModel() {
     try {
         py::gil_scoped_acquire gil;
+        closeTensorCaptureRecorder(tensor_capture_recorder_);
         held_attn_pyobj_ = py::object();
         // Always release py_model_ since it's always initialized now
         py_model_.release();
@@ -890,6 +980,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
 
         if (int(device_props_.enable_layer_micro_batch)) {
+            noteTensorCaptureSkip("microbatch");
             return forwardMicroBatched(inputs);
         }
         PyContextParallelParams cp_params;
@@ -944,6 +1035,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             !graph_required || graph_can_run,
             "CUDA graph is required for fixed-role MTP indexer sharing; eager fallback is disabled");
         if (graph_can_run) {
+            noteTensorCaptureSkip("graph");
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
             RTP_LLM_LOG_DEBUG(
@@ -962,9 +1054,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] using normal forward, is_target_verify=%d, is_prefill=%d",
                               py_model_inputs.attention_inputs.is_target_verify,
                               py_model_inputs.attention_inputs.is_prefill);
-            held_attn_pyobj_      = py_model_.attr("prepare_fmha_impl")(py_model_inputs, false);
+            // Release the local context reference under the GIL even on exceptions.
+            // Cached attention_inputs_ and graph inputs stay untouched.
+            auto eager_inputs = std::move(py_model_inputs);
+            prepareTensorCaptureContext(inputs, eager_inputs.attention_inputs);
+            held_attn_pyobj_      = py_model_.attr("prepare_fmha_impl")(eager_inputs, false);
             auto py_model_forward = py_model_.attr("forward");
-            auto outputs          = py_model_forward(py_model_inputs, held_attn_pyobj_);
+            auto outputs          = py_model_forward(eager_inputs, held_attn_pyobj_);
             py_model_outputs      = outputs.cast<PyModelOutputs>();
             hidden_states         = py_model_outputs.hidden_states.clone();
         }

@@ -102,6 +102,15 @@ py_test(
     deps = ["//rtp_llm:utils"],
 )
 
+py_test(
+    name = "tensor_capture_test",
+    srcs = ["tensor_capture_test.py"],
+    deps = [
+        "//rtp_llm:torch",
+        "//rtp_llm:utils",
+    ],
+)
+
 
 py_test(
     name = "util_test",
@@ -348,4 +357,15 @@ py_test(
     name = "scr_native_logger_test",
     srcs = ["scr_native_logger_test.py"],
     data = ["//rtp_llm/cpp/utils:scr_logger_test_sources"],
+)
+
+py_test(
+    name = "tensor_capture_replay_test",
+    size = "small",
+    srcs = ["tensor_capture_replay_test.py"],
+    args = ["TensorCaptureReplayTest"],
+    deps = [
+        "//rtp_llm:torch",
+        "//rtp_llm:utils",
+    ],
 )

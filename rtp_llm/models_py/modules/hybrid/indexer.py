@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,6 +19,19 @@ if _DEVICE_TYPE == DeviceType.Cuda:
     )
 else:
     fused_logits_head_gate = None  # type: ignore
+
+
+def _note_indexer_capture_skip(
+    attention_inputs: Any, reason: str, layer: Optional[int]
+) -> None:
+    context = getattr(attention_inputs, "tensor_capture_context", None)
+    if context is not None:
+        try:
+            context.note_skip(reason, layer=layer)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Indexer tensor capture skip reporting failed", exc_info=True
+            )
 
 
 class Indexer(nn.Module):
@@ -135,6 +149,7 @@ class Indexer(nn.Module):
             block_size=self.block_size,
             scale_fmt=self.scale_fmt,
             is_neox_style=self.is_neox_style,
+            layer_idx=self.layer_idx,
         )
 
     def _prefill_cp_enabled(self) -> bool:
@@ -381,6 +396,9 @@ class Indexer(nn.Module):
         q_c_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if use_fast_path:
+            _note_indexer_capture_skip(
+                attention_inputs, "dense_fast_path", self.layer_idx
+            )
             key = self._get_k_bf16(hidden_states, fmha_params)
             self.indexer_op.quant_k_only(key, kv_cache, fmha_params.slot_mapping)
             return None

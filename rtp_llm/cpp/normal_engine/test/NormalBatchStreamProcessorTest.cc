@@ -257,6 +257,8 @@ TEST_F(NormalBatchStreamProcessorTest, testSimpleAssemble) {
         EXPECT_EQ(sequence_lengths, toVec<int>(model_input.sequence_lengths));
         EXPECT_EQ(prefix_lengths, toVec<int>(model_input.prefix_lengths));
         ASSERT_TRUE(model_input.record_lengths.has_value());
+        EXPECT_EQ(model_input.record_execution_id, 0);
+        EXPECT_TRUE(model_input.tensor_capture_context_json.empty());
         EXPECT_EQ(model_input.record_lengths->q_tokens, (std::vector<int32_t>{1, 1, 3, 3}));
         EXPECT_EQ(model_input.record_lengths->kv_tokens_before, (std::vector<int32_t>{1, 2, 0, 1}));
         EXPECT_EQ(kv_cache_block_id, toVec<int>(model_input.kv_cache_block_id));
@@ -274,6 +276,7 @@ TEST_F(NormalBatchStreamProcessorTest, testSimpleAssemble) {
         auto& model_input = merge_input_status.value();
         EXPECT_FALSE(model_input.attention_mask.defined());
         EXPECT_FALSE(model_input.record_lengths.has_value());
+        EXPECT_TRUE(model_input.tensor_capture_context_json.empty());
     }
 }
 

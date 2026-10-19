@@ -230,6 +230,20 @@ RecordedBatch::RecordedBatch(ExecutionRecorder&                   recorder,
                              std::vector<ExecutionRecorder::Json> rows):
     timings(rows.size()), recorder_(recorder), record_(std::move(record)), rows_(std::move(rows)) {}
 
+std::string RecordedBatch::tensorCaptureContextJson() const {
+    auto context = record_;
+    const auto identity = recorder_.identity();
+    context.insert(identity.begin(), identity.end());
+    context["model_role"] = std::string("target");
+    ExecutionRecorder::JsonArray requests;
+    requests.reserve(rows_.size());
+    for (const auto& row : rows_) {
+        requests.emplace_back(row);
+    }
+    context["requests"] = std::move(requests);
+    return ExecutionRecorder::toJson(context);
+}
+
 void RecordedBatch::markTimingError() noexcept {
     if (!timing_error_) {
         timing_error_ = true;

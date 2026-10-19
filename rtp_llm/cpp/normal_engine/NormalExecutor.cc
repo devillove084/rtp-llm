@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -191,10 +192,12 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     profile_step_start_(std::move(profile_step_start)),
     profile_step_finish_(std::move(profile_step_finish)),
     dispatch_runner_(cuda_graph::graphGetStreamFromPool(true)) {
-    enable_detail_log_  = params.profiling_debug_logging_config.enable_detail_log;
-    tp_rank_            = params.parallelism_config.tp_rank;
-    parallelism_config_ = params.parallelism_config;
-    auto& recorder      = ExecutionRecorder::instance();
+    enable_detail_log_       = params.profiling_debug_logging_config.enable_detail_log;
+    tensor_capture_enabled_ =
+        PyWrappedModel::tensorCaptureConfigEnabled(params.profiling_debug_logging_config.tensor_capture_config);
+    tp_rank_                = params.parallelism_config.tp_rank;
+    parallelism_config_     = params.parallelism_config;
+    auto& recorder          = ExecutionRecorder::instance();
     if (!warm_up_ && !is_propose_ && recorder.needsConfiguration()) {
         const bool configured =
             recorder.configure(parallelism_config_.world_rank,
@@ -216,6 +219,11 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
         if (!configured) {
             RTP_LLM_LOG_WARNING("batch recorder initialization failed; configuration was not published");
         }
+    }
+    if (tensor_capture_enabled_ && !warm_up_ && !is_propose_ && !recorder.enabled()) {
+        throw std::runtime_error(
+            "tensor capture requires a ready ExecutionRecorder; set RTP_LLM_RECORD_DIR and RTP_LLM_RECORD_SESSION "
+            "and check recorder initialization errors");
     }
     RTP_LLM_LOG_INFO("enable_detail_log_ = %d, tp_rank_ = %d", enable_detail_log_, tp_rank_);
 
@@ -411,6 +419,12 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     if (tp_rank_ == 0 && model_input.record_execution_id) {
         try {
             recorded_batch = recordBatchInputs(model_input, stream_groups);
+            if (tensor_capture_enabled_ && recorded_batch && !warm_up_ && !is_propose_
+                && stream_groups.totalDecodeBatchSize() == 0 && stream_groups.totalContextBatchSize() > 0
+                && !model_input.warmup && !model_input.is_fake_stream && !model_input.is_target_verify
+                && !model_input.is_draft_extend) {
+                model_input.tensor_capture_context_json = recorded_batch->tensorCaptureContextJson();
+            }
         } catch (const std::exception& e) {
             execution_recorder.reportSnapshotError(e.what());
         }
