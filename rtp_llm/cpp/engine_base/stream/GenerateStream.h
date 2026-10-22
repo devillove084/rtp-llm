@@ -297,6 +297,7 @@ public:
     torch::Tensor              multimodalLocations() const;
 
     int64_t getTimeoutMs() const;
+    bool    checkTimeoutAndHasError();
     void    checkTimeout();
 
     void reportEvent(StreamEvents::EventType event,
@@ -748,7 +749,8 @@ public:
     }
 
     bool reuseCache() const {
-        return generate_input_->generate_config->reuse_cache;
+        const auto& config = *generate_input_->generate_config;
+        return config.reuse_cache && !config.isPrefillOnly();
     }
 
     bool enableDeviceCache() const {

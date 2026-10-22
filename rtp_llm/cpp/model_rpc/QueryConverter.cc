@@ -2,11 +2,12 @@
 #include "rtp_llm/cpp/config/RoleTypes.h"
 
 #include <optional>
-
+#include <stdexcept>
 #include "RPCPool.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/model_rpc/TensorPbConvert.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 
 #include <algorithm>
 
@@ -76,10 +77,24 @@ RoleType transRoleAddrType(const RoleAddrPB& role_addr) {
 
 }  // namespace
 
+int QueryConverter::resolveMaxNewTokens(const GenerateConfigPB& config_proto) {
+    const int wire_max_new_tokens = config_proto.max_new_tokens();
+    if (config_proto.prefill_only() && wire_max_new_tokens != 0) {
+        throw std::invalid_argument("prefill_only requires max_new_tokens to be 0, got "
+                                    + std::to_string(wire_max_new_tokens));
+    }
+    if (wire_max_new_tokens < 0) {
+        throw std::invalid_argument("max_new_tokens must be greater than or equal to 0, got "
+                                    + std::to_string(wire_max_new_tokens));
+    }
+    return wire_max_new_tokens;
+}
+
 std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const GenerateConfigPB* config_proto) {
     std::shared_ptr<GenerateConfig> generate_config = std::make_shared<GenerateConfig>();
     generate_config->global_request_id              = config_proto->global_request_id();
-    generate_config->max_new_tokens                 = config_proto->max_new_tokens();
+    const int resolved_max_new_tokens               = resolveMaxNewTokens(*config_proto);
+    generate_config->max_new_tokens                 = resolved_max_new_tokens;
     generate_config->min_new_tokens                 = config_proto->min_new_tokens();
     generate_config->num_beams                      = config_proto->num_beams();
     generate_config->variable_num_beams.resize(config_proto->variable_num_beams_size());
@@ -166,6 +181,7 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     TRANS_OPTIONAL(trace_id);
     TRANS_OPTIONAL(group_timeout);
 
+    generate_config->validatePrefillOnly();
     return generate_config;
 }
 

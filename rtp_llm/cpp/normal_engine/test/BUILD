@@ -71,6 +71,7 @@ cc_test(
     data = [],
     copts = test_copts,
     deps = [
+        "//rtp_llm/cpp/engine_base/schedulers:schedulers",
         "//rtp_llm/cpp/observability:execution_recorder",
         "//rtp_llm/cpp/testing:device_test_utils",
         "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
@@ -95,6 +96,7 @@ cc_test(
     data = [],
     copts = test_copts,
     deps =  [
+        "//rtp_llm/cpp/engine_base/schedulers:schedulers",
         ":mock_engine",
     ] + cuda13_torch_link_deps,
     env = {

@@ -129,7 +129,7 @@ TEST_F(GenerateStreamTest, testAsyncReleaseConcurrentHandoff) {
         ASSERT_GT(stream->stream_cache_resource_->curBlocksNum(), 0);
         stream->incPendingAsyncBookkeeping();
         std::atomic<bool> start{false};
-        std::thread worker([&] {
+        std::thread       worker([&] {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
@@ -151,16 +151,16 @@ TEST_F(GenerateStreamTest, testAsyncReleaseConcurrentHandoff) {
 TEST_F(GenerateStreamTest, testMtpMinNewTokensIgnoresEarlyStopWithinAcceptedBatch) {
     for (bool use_eos : {false, true}) {
         for (bool stop_at_minimum : {false, true}) {
-            auto config = std::make_shared<GenerateConfig>();
+            auto config            = std::make_shared<GenerateConfig>();
             config->min_new_tokens = 8;
             config->max_new_tokens = 8;
-            config->aux_info = true;
-            config->is_streaming = false;
-            config->ignore_eos = !use_eos;
+            config->aux_info       = true;
+            config->is_streaming   = false;
+            config->ignore_eos     = !use_eos;
             if (!use_eos) {
                 config->stop_words_list = {{7}};
             }
-            auto stream = GenerateStreamBuilder().createContextStream({1, 2}, config);
+            auto stream                          = GenerateStreamBuilder().createContextStream({1, 2}, config);
             stream->special_tokens_.eos_token_id = 7;
             stream->update({torch::tensor({{3, 4, 5, 6}}, torch::kInt32), 4});
             ASSERT_FALSE(stream->hasOutput());
@@ -607,6 +607,60 @@ TEST_F(GenerateStreamTest, testMtpAsyncDeviceStateBackCompatWrappers) {
     ASSERT_FALSE(stream->getAcceptTokensGpu().defined());
     ASSERT_FALSE(stream->getNextSeqLenGpu().defined());
     ASSERT_FALSE(stream->getProposeTokensGpu().defined());
+}
+
+TEST_F(GenerateStreamTest, prefillOnlyValidationPreservesCacheSetting) {
+    GenerateConfig config;
+    config.max_new_tokens = 0;
+    config.reuse_cache    = true;
+
+    EXPECT_NO_THROW(config.validatePrefillOnly());
+    EXPECT_TRUE(config.reuse_cache);
+}
+
+TEST_F(GenerateStreamTest, prefillOnlyValidationRejectsUnsupportedConfigWithoutMutation) {
+    struct UnsupportedConfig {
+        const char* name;
+        void (*set)(GenerateConfig&);
+    };
+    constexpr UnsupportedConfig fields[] = {
+        {"min_new_tokens", +[](GenerateConfig& config) { config.min_new_tokens = 1; }},
+        {"num_beams", +[](GenerateConfig& config) { config.num_beams = 2; }},
+        {"variable_num_beams", +[](GenerateConfig& config) { config.variable_num_beams = {1}; }},
+        {"num_return_sequences", +[](GenerateConfig& config) { config.num_return_sequences = 2; }},
+        {"return_logits", +[](GenerateConfig& config) { config.return_logits = true; }},
+        {"calculate_loss", +[](GenerateConfig& config) { config.calculate_loss = 1; }},
+        {"return_softmax_probs", +[](GenerateConfig& config) { config.return_softmax_probs = true; }},
+        {"return_all_probs", +[](GenerateConfig& config) { config.return_all_probs = true; }},
+        {"return_cum_log_probs", +[](GenerateConfig& config) { config.return_cum_log_probs = true; }},
+        {"return_logprobs", +[](GenerateConfig& config) { config.return_logprobs = true; }},
+        {"return_hidden_states", +[](GenerateConfig& config) { config.return_hidden_states = true; }},
+        {"return_all_hidden_states", +[](GenerateConfig& config) { config.return_all_hidden_states = true; }},
+    };
+    for (const auto& field : fields) {
+        SCOPED_TRACE(field.name);
+        GenerateConfig config;
+        config.max_new_tokens = 0;
+        config.reuse_cache    = true;
+        field.set(config);
+
+        try {
+            config.validatePrefillOnly();
+            FAIL() << field.name << " should be rejected";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string(error.what()).find(field.name), std::string::npos);
+        }
+        EXPECT_TRUE(config.reuse_cache);
+    }
+}
+
+TEST_F(GenerateStreamTest, prefillOnlyRejectsNegativeTokenBudget) {
+    GenerateConfig config;
+    config.max_new_tokens = -1;
+    EXPECT_THROW(config.validatePrefillOnly(), std::invalid_argument);
+    EXPECT_EQ(config.max_new_tokens, -1);
+    config.max_new_tokens = 1;
+    EXPECT_NO_THROW(config.validatePrefillOnly());
 }
 
 }  // namespace rtp_llm

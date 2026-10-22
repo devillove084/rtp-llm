@@ -26,7 +26,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     // TP ranks do not see overflowed dimensions when allocating buffers.
     auto shape_hints_t   = torch::empty({(int64_t)shape_hints_size}, torch::kInt64).pin_memory();
     auto shape_hints_ptr = shape_hints_t.data_ptr<int64_t>();
-    shape_hints_ptr[GptModelInputIndex::recordExecutionId]     = inputs.record_execution_id;
+    shape_hints_ptr[GptModelInputIndex::recordExecutionId] = inputs.record_execution_id;
     shape_hints_ptr[GptModelInputIndex::comboTokens] = inputs.combo_tokens.defined() ? inputs.combo_tokens.numel() : 0;
     shape_hints_ptr[GptModelInputIndex::inputLengths] =
         inputs.input_lengths.defined() ? inputs.input_lengths.numel() : 0;
@@ -68,6 +68,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
             0;
     shape_hints_ptr[GptModelInputIndex::needAllLogits]       = inputs.need_all_logits;
     shape_hints_ptr[GptModelInputIndex::needAllHiddenStates] = inputs.need_all_hidden_states;
+    shape_hints_ptr[GptModelInputIndex::skipLmHead]          = inputs.skip_lm_head;
+    shape_hints_ptr[GptModelInputIndex::captureHiddenStates] = inputs.capture_hidden_states;
     shape_hints_ptr[GptModelInputIndex::mtpHiddenStates] =
         inputs.last_hidden_states.defined() ? inputs.last_hidden_states.numel() : 0;
     shape_hints_ptr[GptModelInputIndex::mtpHiddenStatesDtype] =
@@ -109,6 +111,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     int32_t*      mm_features_shape_ptr = nullptr;
     inputs.need_all_logits              = shape_hints_ptr[GptModelInputIndex::needAllLogits];
     inputs.need_all_hidden_states       = shape_hints_ptr[GptModelInputIndex::needAllHiddenStates];
+    inputs.skip_lm_head                 = shape_hints_ptr[GptModelInputIndex::skipLmHead];
+    inputs.capture_hidden_states        = shape_hints_ptr[GptModelInputIndex::captureHiddenStates];
     inputs.skip_run                     = shape_hints_ptr[GptModelInputIndex::skipRun];
     inputs.is_fake_stream               = shape_hints_ptr[GptModelInputIndex::isFakeStream];
     inputs.record_execution_id          = shape_hints_ptr[GptModelInputIndex::recordExecutionId];

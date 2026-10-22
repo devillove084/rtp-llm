@@ -5,6 +5,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
+#include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/GatherBatchScheduler.h"
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
@@ -27,6 +28,7 @@
 #include <list>
 #include <memory>
 #include <thread>
+#include <stdexcept>
 #include <random>
 
 #if USING_CUDA
@@ -150,7 +152,7 @@ void preallocateTorchCudaPoolForPrefill(RoleType role_type, int device_id) {
 
 NormalEngine::NormalEngine(const EngineInitParams&                       params,
                            std::unique_ptr<ProposeModelEngineInitParams> propose_params,
-                           bool defer_loop_start):
+                           bool                                          defer_loop_start):
     EngineBase(params),
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
@@ -356,7 +358,7 @@ absl::StatusOr<GenerateStreamPtr> NormalEngine::preRun(const std::shared_ptr<Gen
                                                          nullptr,
                                                          0,
                                                          mode == preRunMode::prefill_warm_up);
-    stream->setReserveStep(reserve_step_);
+    stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
     if (mode == preRunMode::decode_warm_up) {
         stream->setIsContextStream(false);
         size_t seq_size_per_block = model_config_.attn_config.tokens_per_block;
@@ -547,8 +549,7 @@ std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_ne
     return stream;
 }
 
-void NormalEngine::initCacheManager(std::optional<WarmUpResult> warm_up_result,
-                                    bool defer_connector_start) {
+void NormalEngine::initCacheManager(std::optional<WarmUpResult> warm_up_result, bool defer_connector_start) {
     const bool use_cuda_malloc_block_pool = shouldUseCudaMallocKVCacheBacking(pd_sep_config, cache_store_config);
     if (propose_params_ && propose_params_->draftModel()) {
         auto config = CacheConfigCreator::createSpConfig(model_config_,
@@ -913,36 +914,105 @@ absl::Status NormalEngine::trySaveStepError() const {
     return absl::UnimplementedError("can not save yet!");
 }
 
-std::shared_ptr<GenerateStream> NormalEngine::makeStream(const std::shared_ptr<GenerateInput>& input) {
-    std::shared_ptr<GenerateStream> stream = std::make_shared<NormalGenerateStream>(
+bool NormalEngine::validateStreamForScheduling(const GenerateStreamPtr& stream) const {
+    if (stream->hasError()) {
+        return false;
+    }
+    if (pd_sep_config.role_type != RoleType::DECODE || !stream->generateConfig()->isPrefillOnly()) {
+        return true;
+    }
+    stream->reportError(ErrorCode::INVALID_PARAMS, kDecodeRolePrefillOnlyError);
+    return false;
+}
+
+std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr<GenerateInput>& input) {
+    try {
+        input->generate_config->validatePrefillOnly();
+    } catch (const std::invalid_argument& error) {
+        // Keep invalid request handling on the stream error path instead of exposing
+        // validation exceptions to direct engine callers or RPC adapters.
+        auto safe_input              = std::make_shared<GenerateInput>(*input);
+        auto safe_config             = std::make_shared<GenerateConfig>(*input->generate_config);
+        safe_config->max_new_tokens  = 1;
+        safe_config->return_logprobs = false;
+        safe_input->generate_config  = std::move(safe_config);
+        auto stream                  = std::make_shared<NormalGenerateStream>(
+            safe_input, model_config_, runtime_config, resource_context_, metrics_reporter_);
+        stream->reportError(ErrorCode::INVALID_PARAMS, error.what());
+        return stream;
+    }
+
+    auto stream = std::make_shared<NormalGenerateStream>(
         input, model_config_, runtime_config, resource_context_, metrics_reporter_);
     return stream;
 }
 
+std::shared_ptr<GenerateStream> NormalEngine::makeStream(const std::shared_ptr<GenerateInput>& input) {
+    auto stream = createStream(input);
+    // DecodeRpcServer allocates the destination KV table before enqueue/P-D handoff.
+    stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
+    (void)validateStreamForScheduling(stream);
+    return stream;
+}
+
 void NormalEngine::enqueue(std::shared_ptr<GenerateStream>& stream) {
-    stream->setReserveStep(reserve_step_);
+    stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
+    if (!validateStreamForScheduling(stream)) {
+        return;
+    }
     (void)scheduler_->enqueue(stream);
 }
 
 std::shared_ptr<GenerateStream> NormalEngine::enqueue(const std::shared_ptr<GenerateInput>& input) {
-    std::shared_ptr<GenerateStream> stream = std::make_shared<NormalGenerateStream>(
-        input, model_config_, runtime_config, resource_context_, metrics_reporter_);
-    stream->setReserveStep(reserve_step_);
-    (void)scheduler_->enqueue(stream);
+    auto stream = makeStream(input);
+    enqueue(stream);
     return stream;
 }
 
 std::pair<std::vector<bool>, std::vector<GenerateStreamPtr>>
 NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>& inputs) {
     std::vector<GenerateStreamPtr> streams;
+    std::vector<GenerateStreamPtr> schedulable_streams;
+    std::vector<size_t>            schedulable_indexes;
     streams.reserve(inputs.size());
+    schedulable_streams.reserve(inputs.size());
+    schedulable_indexes.reserve(inputs.size());
     for (auto& inp : inputs) {
-        auto stream = std::make_shared<NormalGenerateStream>(
-            inp, model_config_, runtime_config, resource_context_, metrics_reporter_);
-        stream->setReserveStep(reserve_step_);
+        auto stream = createStream(inp);
+        stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
         streams.push_back(stream);
     }
-    return scheduler_->enqueueGroup(streams);
+
+    std::vector<GenerateStreamPtr> streams_for_mode_check;
+    streams_for_mode_check.reserve(streams.size());
+    for (const auto& stream : streams) {
+        if (!stream->hasError()) {
+            streams_for_mode_check.push_back(stream);
+        }
+    }
+
+    if (hasMixedExecutionModes(streams_for_mode_check)) {
+        for (const auto& stream : streams) {
+            if (!stream->hasError()) {
+                stream->reportError(ErrorCode::INVALID_PARAMS, kMixedForceBatchGroupError);
+            }
+        }
+        return {std::vector<bool>(streams.size(), false), std::move(streams)};
+    }
+
+    for (size_t i = 0; i < streams.size(); ++i) {
+        if (validateStreamForScheduling(streams[i])) {
+            schedulable_indexes.push_back(i);
+            schedulable_streams.push_back(streams[i]);
+        }
+    }
+
+    auto              schedulable_result = scheduler_->enqueueGroup(schedulable_streams);
+    std::vector<bool> enqueue_successes(streams.size(), false);
+    for (size_t i = 0; i < schedulable_indexes.size(); ++i) {
+        enqueue_successes[schedulable_indexes[i]] = schedulable_result.first[i];
+    }
+    return {std::move(enqueue_successes), std::move(streams)};
 }
 
 void NormalEngine::maybeRefreshCacheStatusSnapshot(const std::list<GenerateStreamPtr>& streams) {
@@ -983,7 +1053,8 @@ absl::Status NormalEngine::step() {
         // When TP > 1, all ranks must enter process() together so that
         // tpSyncModelInputs (collective broadcast) does not deadlock.
         // The skip_run flag inside process() handles the "no work" case.
-        if (streams.empty() && parallelism_config.tp_size <= 1) {
+        if (shouldEarlyReturnEmptyBatch(
+                streams.empty(), parallelism_config.tp_size, ffn_disaggregate_config.enable_ffn_disaggregate)) {
             return absl::OkStatus();
         }
     }
@@ -1050,6 +1121,18 @@ bool NormalEngine::isEagle() {
     return false;
 }
 
+size_t NormalEngine::reserveStepForStream(size_t configured_reserve_step, bool is_prefill_only) {
+    return is_prefill_only ? 0 : configured_reserve_step;
+}
+
+bool NormalEngine::shouldEarlyReturnEmptyBatch(bool streams_empty, int64_t tp_size, bool enable_ffn_disaggregate) {
+    return streams_empty && tp_size == 1 && !enable_ffn_disaggregate;
+}
+
+bool NormalEngine::shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_decode_scheduler, int64_t dp_size) {
+    return !has_prefill && (!use_batch_decode_scheduler || dp_size > 1);
+}
+
 void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     if (!running_) {
         return;
@@ -1080,7 +1163,8 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                         has_decode = true;
                     }
                 }
-                if (!has_prefill && !runtime_config.use_batch_decode_scheduler) {
+                if (shouldAddMtpFakePrefill(
+                        has_prefill, runtime_config.use_batch_decode_scheduler, parallelism_config.dp_size)) {
                     streams.emplace_back(
                         MtpExecutor::createMinFakePrefillStream(1, model_config_, runtime_config, resource_context_));
                 }

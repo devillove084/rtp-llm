@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,57 @@ public:
     std::string        trace_id;
     std::optional<int> group_timeout;
     std::string        unique_key;
+
+    bool isPrefillOnly() const {
+        return max_new_tokens == 0;
+    }
+
+    void validatePrefillOnly() {
+        if (max_new_tokens < 0) {
+            throw std::invalid_argument("max_new_tokens must be greater than or equal to 0, got "
+                                        + std::to_string(max_new_tokens));
+        }
+        if (!isPrefillOnly()) {
+            return;
+        }
+        if (min_new_tokens > 0) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support min_new_tokens > 0");
+        }
+        if (num_beams > 1) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support num_beams > 1");
+        }
+        if (!variable_num_beams.empty()) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support non-empty variable_num_beams");
+        }
+        if (num_return_sequences > 1) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support num_return_sequences > 1");
+        }
+        if (return_logits) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_logits");
+        }
+        if (calculate_loss != 0) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support calculate_loss");
+        }
+
+        if (return_softmax_probs) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_softmax_probs");
+        }
+        if (return_all_probs) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_all_probs");
+        }
+        if (return_cum_log_probs) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_cum_log_probs");
+        }
+        if (return_logprobs) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_logprobs");
+        }
+        if (return_hidden_states) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_hidden_states");
+        }
+        if (return_all_hidden_states) {
+            throw std::invalid_argument("max_new_tokens == 0 does not support return_all_hidden_states");
+        }
+    }
 
     bool top1() {
         return top_k == 1;

@@ -210,7 +210,13 @@ protected:
                                    const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                    const MergedOutput&                          draft_prefill_output);
 
-    void releaseAllModelBuffers();
+    void         releaseAllModelBuffers();
+    void         collectPrefillMetrics(const StreamGroups&  stream_groups,
+                                       MtpMetricsCollector& metrics_collector,
+                                       int64_t              tps_execute_time_us,
+                                       int64_t              model_forward_us);
+    absl::Status runDecodeAlignmentOnly(GptModelInputs& model_input);
+    static bool  canEarlyReturnTargetOnlyPrefill(int64_t dp_size, bool enable_ffn_disaggregate);
 
 private:
     std::unique_ptr<ModelBase>                                               model_;
@@ -229,6 +235,10 @@ private:
     WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector> wall_tps_reporter_;
     std::shared_ptr<ExpertBalancer>                                                            expert_balancer_;
     size_t                                                                                     vocab_size_;
+
+    // Retain construction settings for error-path fake alignment; normal batches allocate no extra streams.
+    const ModelConfig   model_config_;
+    const RuntimeConfig runtime_config_;
 
     // for mtp
     DataType                                         data_type_;

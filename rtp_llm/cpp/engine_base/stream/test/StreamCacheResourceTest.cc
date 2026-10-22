@@ -954,4 +954,36 @@ TEST_F(StreamCacheResourceTest, testWaitLoadCacheDone_ZeroReuseLen_DoesNotOverwr
     EXPECT_EQ(stream_->getMtpTokenIndex(), 4);
 }
 
+TEST_F(StreamCacheResourceTest, testPrefillOnlyRecomputesWholePromptWithoutCacheReuse) {
+    for (bool request_reuse : {false, true}) {
+        prepareResource(/*reuse_cache=*/true);
+        stream_->generateConfig()->max_new_tokens       = 0;
+        stream_->generateConfig()->num_return_sequences = 1;
+        stream_->generateConfig()->reuse_cache          = request_reuse;
+        auto& resource                                  = stream_->streamCacheResource();
+        auto  coordinator =
+            std::make_shared<testing::NiceMock<MockKVCacheConnectorCoordinator>>(cache_manager_->config_,
+                                                                                 cache_manager_->kv_cache_config_,
+                                                                                 cache_manager_->runtime_config_,
+                                                                                 cache_manager_->allocator_);
+        ON_CALL(*coordinator, hasActiveConnectors()).WillByDefault(testing::Return(true));
+        ON_CALL(*coordinator, hasP2PConnector()).WillByDefault(testing::Return(true));
+        EXPECT_CALL(*coordinator, asyncRead(testing::_)).Times(0);
+        EXPECT_CALL(*coordinator, asyncWrite(testing::_)).Times(0);
+        cache_manager_->coordinator_ = coordinator;
+        EXPECT_FALSE(stream_->reuseCache());
+        EXPECT_FALSE(resource.reuseCache());
+        ASSERT_TRUE(resource.initKVBlock().ok());
+        EXPECT_EQ(stream_->reuseLength(), 0);
+        EXPECT_EQ(stream_->contextLength(), stream_->inputLength());
+        EXPECT_FALSE(resource.asyncLoadCache());
+        resource.loadCacheSync();
+        ASSERT_TRUE(resource.incrKVBlock().ok());
+        EXPECT_EQ(stream_->generateConfig()->reuse_cache, request_reuse);
+        stream_->reportEvent(StreamEvents::GenerateDone);
+        stream_->moveToNext();
+        EXPECT_EQ(cache_manager_->freeBlocksNum(), 8u);
+    }
+}
+
 }  // namespace rtp_llm

@@ -486,6 +486,10 @@ absl::Status StreamCacheResource::incrKVBlock(size_t reserve_step, int seq_len_o
 
 bool StreamCacheResource::asyncLoadCache() {
     RTP_LLM_PROFILE_FUNCTION();
+    // Capture exports every prompt position, including prefixes available through P2P.
+    if (stream_->generateConfig()->isPrefillOnly()) {
+        return false;
+    }
     if (!resource_context_.cache_manager || !resource_context_.cache_manager->hasActiveConnectors()) {
         return false;
     }
@@ -649,7 +653,7 @@ int StreamCacheResource::mallocFailedTimes() const {
 bool StreamCacheResource::reuseCache() const {
     // AND logic: global REUSE_CACHE=1 AND per-request reuse_cache both must be true.
     // Per-request field flows frontend → FlexLB → engine via protobuf.
-    return resource_context_.reuse_cache && stream_->reuseCache();
+    return !stream_->generateConfig()->isPrefillOnly() && resource_context_.reuse_cache && stream_->reuseCache();
 }
 
 bool StreamCacheResource::enableRemoteCache() const {
@@ -670,6 +674,9 @@ bool StreamCacheResource::enableTieredMemoryCache() const {
 
 void StreamCacheResource::loadCacheSync() {
     RTP_LLM_PROFILE_FUNCTION();
+    if (stream_->generateConfig()->isPrefillOnly()) {
+        return;
+    }
     if (!resource_context_.cache_manager || !resource_context_.cache_manager->hasActiveConnectors()) {
         return;
     }
