@@ -361,6 +361,8 @@ struct PyModelInputs {
 
     // Internal homogeneous-batch signal; not part of the Generate RPC/config surface.
     bool capture_hidden_states = false;
+    // The caller will copy canonical micro-batch rows into a final dense output.
+    bool micro_batch_output_will_merge = false;
 
     bool hasAttentionInputsByTag() const {
         return !attention_inputs_by_tag.empty();
@@ -368,7 +370,12 @@ struct PyModelInputs {
 };
 
 struct PyModelOutputs {
+    // Canonical final hidden states consumed by LM head/sampler/response.
     torch::Tensor hidden_states;
+    // Optional packed auxiliary payload consumed only by the capture side path.
+    std::optional<torch::Tensor> captured_hidden_states;
+    // Recoverable capture-only diagnostic. Canonical serving output remains valid.
+    std::optional<std::string> capture_error;
     // Optional model-side features consumed by speculative decoders.  This is
     // a first-class forward output because CUDA graph replay does not execute
     // Python and therefore cannot safely recover it from mutable model state.

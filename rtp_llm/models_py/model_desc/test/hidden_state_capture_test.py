@@ -7,18 +7,22 @@ import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 from torch import nn
 
 from rtp_llm.models_py.model_desc.disaggregate_qwen3 import (
     BatchSplitInfo,
+    CaptureStatus,
     Qwen3AttnModel,
     Qwen3GemmModel,
 )
 from rtp_llm.models_py.model_desc.generic_moe import DecodeLayerOutput, GenericMoeModel
-from rtp_llm.models_py.model_desc.hidden_state_capture import CaptureContext
+from rtp_llm.models_py.model_desc.hidden_state_capture import (
+    CaptureContext,
+    is_fatal_capture_error,
+)
 from rtp_llm.models_py.model_desc.kimi_linear import KimiLinearModel
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.model_desc.multimodal_generic import MultimodalGenericModel
@@ -200,10 +204,13 @@ def _make_inputs(
     input_ids: list[int],
     capture_hidden_states: bool,
     dtype: torch.dtype = torch.int64,
+    *,
+    micro_batch_output_will_merge: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         input_ids=torch.tensor(input_ids, dtype=dtype),
         capture_hidden_states=capture_hidden_states,
+        micro_batch_output_will_merge=micro_batch_output_will_merge,
     )
 
 
@@ -257,7 +264,7 @@ def _run_disaggregate_final_output(
     object.__setattr__(
         model,
         "send_to_attention",
-        lambda tensor, micro_batch_sizes, captured=None: sent.append(
+        lambda tensor, micro_batch_sizes, captured=None, *, is_final=False, capture_error=None: sent.append(
             (captured if captured is not None else tensor).clone()
         ),
     )
@@ -275,6 +282,63 @@ def _run_disaggregate_final_output(
     ):
         model.forward_micro_batch([])
     return sent
+
+
+def _run_disaggregate_capture_protocol(
+    model: Qwen3GemmModel,
+    input_ids_by_rank: tuple[list[int], list[int]],
+    capture_flags: tuple[bool, bool],
+    *,
+    compute_dtype: torch.dtype = torch.float32,
+):
+    payloads = [
+        torch.tensor([len(ids), int(capture)], dtype=torch.int64)
+        for ids, capture in zip(input_ids_by_rank, capture_flags)
+    ] + [torch.tensor(ids, dtype=torch.int32) for ids in input_ids_by_rank if ids]
+    sent = {rank: [] for rank in model.attn_dp_rank}
+
+    def capture_send(tensor, rank, group):
+        assert tensor.is_contiguous()
+        assert torch.ops.aten.is_non_overlapping_and_dense.default(tensor)
+        sent[rank].append(tensor.clone())
+
+    with (
+        patch(
+            "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+            side_effect=_copy_recv_payloads(payloads),
+        ),
+        patch(
+            "rtp_llm.models_py.model_desc.disaggregate_qwen3.send",
+            side_effect=capture_send,
+        ),
+    ):
+        model.forward_micro_batch([])
+
+    final_messages = [sent[rank][2:] for rank in model.attn_dp_rank]
+    outputs = []
+    for ids, capture, messages in zip(input_ids_by_rank, capture_flags, final_messages):
+        attention_model = _make_disaggregate_attention_model()
+        attention_model.config = SimpleNamespace(
+            hidden_size=2,
+            hidden_state_capture_layer_ids=model.config.hidden_state_capture_layer_ids,
+            compute_dtype=compute_dtype,
+        )
+        attention_model.layer_num = 0
+        attention_model.attention_layers = nn.ModuleList()
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                side_effect=_copy_recv_payloads(messages),
+            ) as recv_mock,
+            patch("rtp_llm.models_py.model_desc.disaggregate_qwen3.send"),
+        ):
+            outputs.extend(
+                attention_model.forward_micro_batch(
+                    [_make_inputs(ids, capture, dtype=torch.int32)]
+                )
+            )
+        assert recv_mock.call_count == len(messages)
+    return final_messages, outputs
 
 
 def _make_qwen_model(layer_ids: list[int]) -> Qwen3Model:
@@ -430,26 +494,32 @@ def _forward_qwen3_next(model: Qwen3NextModel, inputs: SimpleNamespace):
         is_prefill=False, is_target_verify=False, is_cuda_graph=False
     )
     inputs.attention_inputs = {"default": attention_inputs}
-    with patch(
-        "rtp_llm.models_py.model_desc.qwen3_next.get_primary_attention_inputs",
-        return_value=attention_inputs,
-    ), patch(
-        "rtp_llm.models_py.model_desc.qwen3_next.select_attention_inputs_for_layer",
-        return_value=attention_inputs,
+    with (
+        patch(
+            "rtp_llm.models_py.model_desc.qwen3_next.get_primary_attention_inputs",
+            return_value=attention_inputs,
+        ),
+        patch(
+            "rtp_llm.models_py.model_desc.qwen3_next.select_attention_inputs_for_layer",
+            return_value=attention_inputs,
+        ),
     ):
         return model.forward(inputs, fmha_impl=object())
 
 
-def _forward_kimi(model: KimiLinearModel, inputs: SimpleNamespace) -> torch.Tensor:
+def _forward_kimi(model: KimiLinearModel, inputs: SimpleNamespace):
     attention_inputs = SimpleNamespace(is_prefill=False, is_target_verify=False)
-    with patch(
-        "rtp_llm.models_py.model_desc.kimi_linear.get_primary_attention_inputs",
-        return_value=attention_inputs,
-    ), patch(
-        "rtp_llm.models_py.model_desc.kimi_linear.select_attention_inputs_for_layer",
-        return_value=attention_inputs,
+    with (
+        patch(
+            "rtp_llm.models_py.model_desc.kimi_linear.get_primary_attention_inputs",
+            return_value=attention_inputs,
+        ),
+        patch(
+            "rtp_llm.models_py.model_desc.kimi_linear.select_attention_inputs_for_layer",
+            return_value=attention_inputs,
+        ),
     ):
-        return model.forward(inputs, fmha_impl=object()).hidden_states
+        return model.forward(inputs, fmha_impl=object())
 
 
 class HiddenStateCaptureTest(unittest.TestCase):
@@ -461,14 +531,15 @@ class HiddenStateCaptureTest(unittest.TestCase):
 
         model = _CaptureModel([2, 0])
         hidden = torch.tensor([[1.0, 2.0]])
-        with patch.object(
-            torch.autograd, "_profiler_enabled", return_value=False
-        ), patch.object(torch._C._profiler, "_RecordFunctionFast") as record_range:
+        with (
+            patch.object(torch.autograd, "_profiler_enabled", return_value=False),
+            patch.object(torch._C._profiler, "_RecordFunctionFast") as record_range,
+        ):
             capture = model.capture_context(True)
             self.assertIs(capture._profile_noop, _NOOP_RECORD_FUNCTION_RANGE)
             for layer_id in range(3):
                 capture.capture_layer(UnformattableLayerId(layer_id), hidden)
-            output = capture.finalize(hidden).hidden_states
+            output = capture.finalize(hidden).captured_hidden_states
         record_range.assert_not_called()
         torch.testing.assert_close(output, torch.cat([hidden] * 3, dim=-1))
 
@@ -501,10 +572,14 @@ class HiddenStateCaptureTest(unittest.TestCase):
                 layer_hook = Mock(side_effect=lambda h, r: h + r)
                 final_hook = Mock(side_effect=lambda h, r: h + r)
                 plan = CaptureContext.configured([2, 0], layer_hook, final_hook)
-                with patch.object(
-                    torch._C, "_profiler", profiler, create=True
-                ), patch.object(
-                    torch.autograd, "_profiler_enabled", return_value=True, create=True
+                with (
+                    patch.object(torch._C, "_profiler", profiler, create=True),
+                    patch.object(
+                        torch.autograd,
+                        "_profiler_enabled",
+                        return_value=True,
+                        create=True,
+                    ),
                 ):
                     owner = {
                         "torch_c": torch._C,
@@ -521,14 +596,20 @@ class HiddenStateCaptureTest(unittest.TestCase):
                         capture.capture_layer(
                             UnformattableLayerId(layer_id), hidden + layer_id, residual
                         )
-                    output = capture.finalize(hidden + 10, residual).hidden_states
+                    output = capture.finalize(
+                        hidden + 10, residual
+                    ).captured_hidden_states
                 record_range.assert_not_called()
                 self.assertEqual(layer_hook.call_count, 2)
                 final_hook.assert_called_once()
                 torch.testing.assert_close(
                     output,
                     torch.cat(
-                        [hidden + 2 + residual, hidden + residual, hidden + 10 + residual],
+                        [
+                            hidden + 2 + residual,
+                            hidden + residual,
+                            hidden + 10 + residual,
+                        ],
                         dim=-1,
                     ),
                 )
@@ -538,23 +619,29 @@ class HiddenStateCaptureTest(unittest.TestCase):
         plan = CaptureContext.configured([0], lambda h, r: h, lambda h, r: h)
         record_range = Mock(side_effect=lambda name: nullcontext())
         profiler = SimpleNamespace(_RecordFunctionFast=record_range)
-        with patch.object(
-            torch._C, "_profiler", profiler, create=True
-        ), patch.object(
-            torch.autograd, "_profiler_enabled", return_value=True, create=True
-        ) as profiler_enabled:
+        with (
+            patch.object(torch._C, "_profiler", profiler, create=True),
+            patch.object(
+                torch.autograd, "_profiler_enabled", return_value=True, create=True
+            ) as profiler_enabled,
+        ):
             capture = plan.for_forward(True)
             self.assertIs(capture._profile_enabled, True)
             self.assertIs(capture._record_function_fast, record_range)
             profiler_enabled.assert_called_once_with()
-            profiler_enabled.side_effect = AssertionError("profiler state was rechecked")
-            with disable_record_function_ranges(), patch.object(
-                profiler,
-                "_RecordFunctionFast",
-                side_effect=AssertionError("range factory was not cached"),
+            profiler_enabled.side_effect = AssertionError(
+                "profiler state was rechecked"
+            )
+            with (
+                disable_record_function_ranges(),
+                patch.object(
+                    profiler,
+                    "_RecordFunctionFast",
+                    side_effect=AssertionError("range factory was not cached"),
+                ),
             ):
                 capture.capture_layer(0, hidden)
-                output = capture.finalize(hidden).hidden_states
+                output = capture.finalize(hidden).captured_hidden_states
         self.assertEqual(
             [call.args[0] for call in record_range.call_args_list],
             ["hidden_state_capture.layer(layer=0)", "hidden_state_capture.pack"],
@@ -629,7 +716,7 @@ class HiddenStateCaptureTest(unittest.TestCase):
                         hidden + layer_id,
                         residual,
                     )
-                output = capture.finalize(hidden + 10, residual).hidden_states
+                output = capture.finalize(hidden + 10, residual).captured_hidden_states
 
             assert len(layer_calls) == 2 and len(final_calls) == 1
             torch.testing.assert_close(
@@ -694,7 +781,7 @@ class HiddenStateCaptureTest(unittest.TestCase):
             capture = model.capture_context(True)
             for layer_id in range(3):
                 capture.capture_layer(layer_id, hidden + layer_id, residual)
-            output = capture.finalize(hidden, residual).hidden_states
+            output = capture.finalize(hidden, residual).captured_hidden_states
         events = [
             e for e in prof.events() if e.name.startswith("hidden_state_capture.")
         ]
@@ -738,23 +825,71 @@ class HiddenStateCaptureTest(unittest.TestCase):
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU]
         ) as prof:
+            layer_capture = model.capture_context(True)
+            with patch.object(
+                layer_capture,
+                "_canonical_layer",
+                side_effect=RuntimeError("layer failure"),
+            ):
+                layer_capture.capture_layer(0, hidden)
+            layer_capture.capture_layer(0, hidden)
+            layer_output = layer_capture.finalize(hidden)
+
+            pack_model = _CaptureModel([0])
+            pack_capture = pack_model.capture_context(True)
+            pack_capture.capture_layer(0, torch.ones(2, 2))
+            pack_output = pack_capture.finalize(hidden)
+            self.assertEqual(pack_model.final_hook_calls, 1)
+            repeated_pack_output = pack_capture.finalize(hidden)
+            self.assertEqual(pack_model.final_hook_calls, 2)
+
             capture = model.capture_context(True)
-            with patch.object(
-                capture, "_canonical_layer", side_effect=RuntimeError("layer failure")
-            ), self.assertRaisesRegex(RuntimeError, "layer failure"):
-                capture.capture_layer(0, hidden)
             capture.capture_layer(0, hidden)
-            with patch.object(
-                torch, "cat", side_effect=RuntimeError("pack failure")
-            ), self.assertRaisesRegex(RuntimeError, "pack failure"):
-                capture.finalize(hidden)
-            output = capture.finalize(hidden).hidden_states
+            output = capture.finalize(hidden)
         events = [
             e for e in prof.events() if e.name.startswith("hidden_state_capture.")
         ]
-        self.assertEqual(len(events), 4)
+        self.assertEqual(
+            [e.name for e in events],
+            [
+                "hidden_state_capture.layer(layer=0)",
+                "hidden_state_capture.layer(layer=0)",
+                "hidden_state_capture.pack",
+                "hidden_state_capture.layer(layer=0)",
+                "hidden_state_capture.pack",
+            ],
+        )
         self.assertTrue(all(e.cpu_parent is None for e in events))
-        torch.testing.assert_close(output, torch.cat([hidden, hidden], dim=-1))
+        for failed_output, pattern in (
+            (layer_output, r"^RuntimeError: layer failure$"),
+            (pack_output, r"^RuntimeError: Sizes of tensors must match"),
+            (repeated_pack_output, r"^RuntimeError: Sizes of tensors must match"),
+        ):
+            self.assertEqual(failed_output.hidden_states.data_ptr(), hidden.data_ptr())
+            self.assertIsNone(failed_output.captured_hidden_states)
+            self.assertRegex(failed_output.capture_error, pattern)
+        torch.testing.assert_close(output.hidden_states, hidden)
+        torch.testing.assert_close(
+            output.captured_hidden_states, torch.cat([hidden, hidden], dim=-1)
+        )
+        self.assertIsNone(output.capture_error)
+
+    def test_capture_pack_range_exit_failure_discards_payload(self) -> None:
+        hidden = torch.ones(1, 2)
+        capture = _CaptureModel([0]).capture_context(True)
+        capture.capture_layer(0, hidden)
+        record_range = MagicMock()
+        record_range.__exit__.side_effect = RuntimeError("pack range close failure")
+        with (
+            patch.object(capture, "_record_function_fast", return_value=record_range),
+            patch.object(torch, "cat", wraps=torch.cat) as pack,
+        ):
+            output = capture.finalize(hidden)
+        pack.assert_called_once()
+        record_range.__exit__.assert_called_once_with(None, None, None)
+        self.assertEqual(output.hidden_states.data_ptr(), hidden.data_ptr())
+        self.assertIsNone(output.captured_hidden_states)
+        self.assertEqual(output.capture_error, "RuntimeError: pack range close failure")
 
     def test_context_packs_layers_in_configured_order(self) -> None:
         model = _CaptureModel([2, 0])
@@ -767,13 +902,147 @@ class HiddenStateCaptureTest(unittest.TestCase):
         capture.capture_layer(0, layer0)
         capture.capture_layer(1, layer1)
         capture.capture_layer(2, layer2)
-        packed = capture.finalize(final_hidden_states).hidden_states
-
+        outputs = capture.finalize(final_hidden_states)
+        torch.testing.assert_close(outputs.hidden_states, final_hidden_states)
         torch.testing.assert_close(
-            packed,
+            outputs.captured_hidden_states,
             torch.cat((layer2, layer0, final_hidden_states), dim=-1),
         )
-        self.assertEqual(packed.shape[-1], 6)
+        self.assertEqual(outputs.captured_hidden_states.shape[-1], 6)
+
+    def test_capture_layer_error_discards_partial_capture_and_is_forward_local(
+        self,
+    ) -> None:
+        hidden = torch.tensor([[1.0, 2.0]])
+        residual = torch.tensor([[3.0, 4.0]])
+        for error in (ValueError("layer shape failure"), RuntimeError("layer failure")):
+            with self.subTest(error=type(error).__name__):
+                model = _CaptureModel([1, 0])
+                capture = model.capture_context(True)
+                capture.capture_layer(0, hidden, residual)
+                with patch.object(
+                    capture, "_canonical_layer", side_effect=error
+                ) as layer_hook:
+                    capture.capture_layer(1, hidden, residual)
+                    capture.capture_layer(0, hidden, residual)
+                    capture.capture_layer(1, hidden, residual)
+                layer_hook.assert_called_once_with(hidden, residual)
+                self.assertFalse(capture.wants_layer(0))
+                self.assertFalse(capture.wants_layer(1))
+                output = capture.finalize(hidden, residual)
+                torch.testing.assert_close(output.hidden_states, hidden + residual)
+                self.assertIsNone(output.captured_hidden_states)
+                self.assertEqual(
+                    output.capture_error, f"{type(error).__name__}: {error}"
+                )
+                self.assertIsNone(capture._captured_hidden_states)
+                self.assertEqual(model.final_hook_calls, 1)
+
+                next_capture = model.capture_context(True)
+                for layer_id in (0, 1):
+                    next_capture.capture_layer(layer_id, hidden, residual)
+                next_output = next_capture.finalize(hidden, residual)
+                torch.testing.assert_close(next_output.hidden_states, hidden + residual)
+                torch.testing.assert_close(
+                    next_output.captured_hidden_states,
+                    torch.cat([hidden + residual] * 3, dim=-1),
+                )
+                self.assertIsNone(next_output.capture_error)
+
+    def test_missing_configured_layer_only_fails_capture(self) -> None:
+        model = _CaptureModel([2, 0])
+        hidden = torch.tensor([[1.0, 2.0]])
+        residual = torch.tensor([[3.0, 4.0]])
+        capture = model.capture_context(True)
+        capture.capture_layer(0, hidden, residual)
+        with patch.object(torch, "cat") as pack:
+            output = capture.finalize(hidden, residual)
+        pack.assert_not_called()
+        torch.testing.assert_close(output.hidden_states, hidden + residual)
+        self.assertIsNone(output.captured_hidden_states)
+        self.assertEqual(
+            output.capture_error,
+            "RuntimeError: hidden-state capture did not visit configured layers [2]",
+        )
+        self.assertEqual(model.final_hook_calls, 1)
+
+    def test_capture_fatal_layer_and_pack_errors_propagate(self) -> None:
+        hidden = torch.ones(1, 2)
+        errors = [
+            MemoryError("host allocation failed"),
+            torch.OutOfMemoryError("device allocation failed"),
+            RuntimeError("CUDA error: invalid configuration argument"),
+            RuntimeError("CUDA driver error: invalid device context"),
+            RuntimeError("CUDA runtime error: unknown error"),
+            RuntimeError("HIP error: invalid device function"),
+            RuntimeError("HIP runtime error: unknown error"),
+            RuntimeError("out of memory"),
+            RuntimeError("OutOfMemoryError: allocation failed"),
+            RuntimeError("CuBlAs_Status_Alloc_Failed"),
+            RuntimeError("CUDNN_STATUS_ALLOC_FAILED"),
+            RuntimeError("illegal memory access"),
+            RuntimeError("ILLEGAL ADDRESS"),
+            RuntimeError("invalid device pointer"),
+            RuntimeError("misaligned address"),
+            RuntimeError("device-side assert"),
+            RuntimeError("launch failure"),
+            RuntimeError("launch failed"),
+            RuntimeError("NCCL error: watchdog failure"),
+            RuntimeError("Collective failed"),
+            RuntimeError("Collective timed out"),
+            KeyboardInterrupt("cancelled"),
+            SystemExit("shutdown"),
+        ]
+        for error_type in (
+            getattr(torch, "AcceleratorError", None),
+            getattr(getattr(torch, "distributed", None), "DistError", None),
+        ):
+            if error_type is not None:
+                errors.append(error_type("device execution failed"))
+        for stage in ("layer", "pack"):
+            for error in errors:
+                with self.subTest(stage=stage, error=repr(error)):
+                    capture = _CaptureModel([0]).capture_context(True)
+                    if stage == "layer":
+                        target, attribute = capture, "_canonical_layer"
+                    else:
+                        capture.capture_layer(0, hidden)
+                        target, attribute = torch, "cat"
+                    with patch.object(target, attribute, side_effect=error):
+                        with self.assertRaises(type(error)) as raised:
+                            if stage == "layer":
+                                capture.capture_layer(0, hidden)
+                            else:
+                                capture.finalize(hidden)
+                    self.assertIs(raised.exception, error)
+                    self.assertIsNone(capture._capture_error)
+
+    def test_capture_fatal_classifier_prefers_types_to_message_fallback(self) -> None:
+        class UnformattableFatal(MemoryError):
+            def __str__(self):
+                raise AssertionError("typed fatal error must not format its message")
+
+        self.assertTrue(is_fatal_capture_error(UnformattableFatal()))
+        self.assertFalse(is_fatal_capture_error(ValueError("capture shape mismatch")))
+        self.assertFalse(is_fatal_capture_error(RuntimeError("capture pack failure")))
+
+    def test_canonical_final_errors_are_never_capture_errors(self) -> None:
+        hidden = torch.ones(1, 2)
+        residual = torch.full_like(hidden, 3)
+        for requested, layer_error in ((False, False), (True, False), (True, True)):
+            with self.subTest(requested=requested, layer_error=layer_error):
+                error = ValueError("final norm failure")
+                final_hook = Mock(side_effect=error)
+                layer_hook = Mock(return_value=hidden + residual)
+                if layer_error:
+                    layer_hook.side_effect = RuntimeError("layer failure")
+                plan = CaptureContext.configured([0], layer_hook, final_hook)
+                capture = plan.for_forward(requested)
+                capture.capture_layer(0, hidden, residual)
+                with self.assertRaisesRegex(ValueError, "final norm failure") as raised:
+                    capture.finalize(hidden, residual)
+                self.assertIs(raised.exception, error)
+                final_hook.assert_called_once_with(hidden, residual)
 
     def test_active_capture_requires_final_hook(self) -> None:
         capture = CaptureContext(enabled=True)
@@ -862,6 +1131,8 @@ class HiddenStateCaptureTest(unittest.TestCase):
             output.hidden_states.data_ptr(), final_hidden_states.data_ptr()
         )
         self.assertEqual(model.final_hook_calls, 1)
+        self.assertIsNone(output.captured_hidden_states)
+        self.assertIsNone(output.capture_error)
 
     def test_active_context_is_forward_local_and_canonicalizes_lazily(self) -> None:
         model = _CaptureModel([1])
@@ -878,8 +1149,9 @@ class HiddenStateCaptureTest(unittest.TestCase):
         first.capture_layer(1, hidden_states, residual)
         self.assertEqual(model.layer_hook_calls, [1])
         output = first.finalize(hidden_states, residual)
+        torch.testing.assert_close(output.hidden_states, hidden_states + residual)
         torch.testing.assert_close(
-            output.hidden_states,
+            output.captured_hidden_states,
             torch.cat((hidden_states + residual, hidden_states + residual), dim=-1),
         )
 
@@ -887,14 +1159,15 @@ class HiddenStateCaptureTest(unittest.TestCase):
         model = _make_qwen_model([2, 0])
         inputs = _make_inputs([1, 2], capture_hidden_states=True)
 
-        outputs = model.forward(inputs, fmha_impl=object()).hidden_states
+        outputs = model.forward(inputs, fmha_impl=object())
         embedded = model.embed_tokens(inputs.input_ids)
         layer0 = embedded + 1
         layer2 = layer0 + 2 + 3
-        expected = torch.cat((layer2, layer0, layer2 * 10), dim=-1)
+        expected_capture = torch.cat((layer2, layer0, layer2 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs.hidden_states, layer2 * 10)
+        torch.testing.assert_close(outputs.captured_hidden_states, expected_capture)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_qwen_positive_path_keeps_ordinary_hidden_shape(self) -> None:
         model = _make_qwen_model([2, 0])
@@ -914,7 +1187,6 @@ class HiddenStateCaptureTest(unittest.TestCase):
             outputs_with_aux = _forward_qwen3_next(model, inputs)
         norm.assert_called_once()
 
-        outputs = outputs_with_aux.hidden_states
         embedded = model.embed_tokens(inputs.input_ids)
         layer0_hidden = embedded + 1
         layer0_residual = torch.full_like(embedded, 10)
@@ -922,10 +1194,13 @@ class HiddenStateCaptureTest(unittest.TestCase):
         layer1_hidden = layer0_hidden + 2
         layer1_residual = layer0_residual + 20
         layer1 = layer1_hidden + layer1_residual
-        expected = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
+        expected_capture = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs_with_aux.hidden_states, layer1 * 10)
+        torch.testing.assert_close(
+            outputs_with_aux.captured_hidden_states, expected_capture
+        )
+        self.assertEqual(tuple(outputs_with_aux.hidden_states.shape), (2, 2))
 
         # The new TorchSpec capture must not populate the legacy MTP channel.
         self.assertIsNone(outputs_with_aux.mtp_target_hidden_states)
@@ -966,9 +1241,13 @@ class HiddenStateCaptureTest(unittest.TestCase):
                 ) as norm:
                     outputs = _forward_qwen3_next(model, inputs)
                 norm.assert_called_once()
-                torch.testing.assert_close(
-                    outputs.hidden_states, expected_capture if enabled else layer1 * 10
-                )
+                torch.testing.assert_close(outputs.hidden_states, layer1 * 10)
+                if enabled:
+                    torch.testing.assert_close(
+                        outputs.captured_hidden_states, expected_capture
+                    )
+                else:
+                    self.assertIsNone(outputs.captured_hidden_states)
                 torch.testing.assert_close(
                     outputs.mtp_target_hidden_states,
                     torch.cat((layer0, layer1), dim=-1),
@@ -1007,10 +1286,11 @@ class HiddenStateCaptureTest(unittest.TestCase):
         layer1_hidden = layer0_hidden + 2
         layer1_residual = layer0_residual + 20
         layer1 = layer1_hidden + layer1_residual
-        expected = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
+        expected_capture = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs.hidden_states, layer1 * 10)
+        torch.testing.assert_close(outputs.captured_hidden_states, expected_capture)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_kimi_linear_capture_disabled_keeps_ordinary_width(self) -> None:
         model = _make_kimi_linear_model([1, 0])
@@ -1020,22 +1300,25 @@ class HiddenStateCaptureTest(unittest.TestCase):
         embedded = model.embed_tokens(inputs.input_ids)
         expected = (embedded + 1 + 2 + 30) * 10
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 2))
+        torch.testing.assert_close(outputs.hidden_states, expected)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
+        self.assertIsNone(outputs.captured_hidden_states)
+        self.assertIsNone(outputs.capture_error)
 
     def test_qwen3vl_capture_is_after_deepstack_and_in_configured_order(self) -> None:
         model = _make_qwen3vl_model([1, 0])
         inputs = _make_vl_inputs(capture_hidden_states=True)
 
-        outputs = model.forward(inputs, fmha_impl=object()).hidden_states
+        outputs = model.forward(inputs, fmha_impl=object())
         embedded = model.embed_tokens(inputs.input_ids, None, None, None)
         deepstack0, deepstack1 = _deepstack_offsets(embedded)
         layer0 = embedded + 1 + deepstack0
         layer1 = layer0 + 2 + deepstack1
-        expected = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
+        expected_capture = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs.hidden_states, layer1 * 10)
+        torch.testing.assert_close(outputs.captured_hidden_states, expected_capture)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_qwen3vl_capture_disabled_keeps_ordinary_width(self) -> None:
         model = _make_qwen3vl_model([1, 0])
@@ -1053,7 +1336,7 @@ class HiddenStateCaptureTest(unittest.TestCase):
         model = _make_qwen3vl_moe_model([1, 0])
         inputs = _make_vl_inputs(capture_hidden_states=True)
 
-        outputs = model.forward(inputs, fmha_impl=object()).hidden_states
+        outputs = model.forward(inputs, fmha_impl=object())
         embedded = model.embed_tokens(inputs.input_ids, None, None, None)
         deepstack0, deepstack1 = _deepstack_offsets(embedded)
         layer0_hidden = embedded + 1 + deepstack0
@@ -1062,10 +1345,11 @@ class HiddenStateCaptureTest(unittest.TestCase):
         layer1_hidden = layer0_hidden + 2 + deepstack1
         layer1_residual = layer0_residual + 20
         layer1 = layer1_hidden + layer1_residual
-        expected = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
+        expected_capture = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs.hidden_states, layer1 * 10)
+        torch.testing.assert_close(outputs.captured_hidden_states, expected_capture)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_qwen3vl_moe_capture_disabled_keeps_ordinary_width(self) -> None:
         model = _make_qwen3vl_moe_model([1, 0])
@@ -1137,35 +1421,16 @@ class HiddenStateCaptureTest(unittest.TestCase):
             _make_inputs([3], capture_hidden_states=True, dtype=torch.int32),
         ]
 
-        with patch(
-            "rtp_llm.models_py.model_desc.disaggregate_qwen3.send"
-        ) as send_mock, self.assertRaisesRegex(
-            Exception,
-            "capture_hidden_states must be consistent within an attention DP rank",
+        with (
+            patch("rtp_llm.models_py.model_desc.disaggregate_qwen3.send") as send_mock,
+            self.assertRaisesRegex(
+                Exception,
+                "capture_hidden_states must be consistent within an attention DP rank",
+            ),
         ):
             model.send_mirco_batch_split_info(inputs)
 
         send_mock.assert_not_called()
-
-    def test_disaggregate_attention_final_width_tracks_capture_flag(self) -> None:
-        model = _make_disaggregate_attention_model()
-        model.config = SimpleNamespace(
-            hidden_size=2,
-            hidden_state_capture_layer_ids=[1, 0],
-            compute_dtype=torch.float16,
-        )
-
-        for capture_hidden_states, expected_width in ((False, 2), (True, 6)):
-            with self.subTest(capture_hidden_states=capture_hidden_states):
-                with patch(
-                    "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv"
-                ) as recv_mock:
-                    output = model.recv_final_from_ffn_service(
-                        token_num=3, capture_hidden_states=capture_hidden_states
-                    )
-
-                self.assertEqual(tuple(output.shape), (3, expected_width))
-                self.assertEqual(recv_mock.call_count, 1)
 
     def test_disaggregate_receive_buffers_use_configured_compute_dtype(self) -> None:
         for compute_dtype in (torch.float16, torch.bfloat16):
@@ -1190,7 +1455,16 @@ class HiddenStateCaptureTest(unittest.TestCase):
                 )
 
                 with patch(
-                    "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv"
+                    "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                    side_effect=_copy_recv_payloads(
+                        [
+                            torch.ones(1, 8),
+                            torch.ones(2, 8),
+                            torch.ones(3, 16),
+                            torch.tensor([0], dtype=torch.int64),
+                            torch.ones(3, 24),
+                        ]
+                    ),
                 ) as recv_mock:
                     from_attention = gemm_model.recv_from_attention([1, 2], 3)
                     from_ffn = attn_model.recv_from_ffn_service(3)
@@ -1198,8 +1472,11 @@ class HiddenStateCaptureTest(unittest.TestCase):
 
                 self.assertEqual(from_attention.dtype, compute_dtype)
                 self.assertEqual(from_ffn.dtype, compute_dtype)
-                self.assertEqual(final_from_ffn.dtype, compute_dtype)
-                self.assertEqual(recv_mock.call_count, 4)
+                self.assertEqual(final_from_ffn.hidden_states.dtype, compute_dtype)
+                self.assertEqual(
+                    final_from_ffn.captured_hidden_states.dtype, compute_dtype
+                )
+                self.assertEqual(recv_mock.call_count, 5)
 
     def test_disaggregate_ffn_applies_capture_flag_for_true_and_false(self) -> None:
         for capture_hidden_states in (False, True):
@@ -1348,62 +1625,290 @@ class HiddenStateCaptureTest(unittest.TestCase):
                     self.assertEqual(len(sent), len(sizes))
 
     def test_disaggregate_ffn_routes_per_rank_final_hidden_states(self) -> None:
+        cases = (
+            ("all_off", (False, False), ([1, 2], [3, 4])),
+            ("mixed", (False, True), ([1, 2], [3, 4])),
+            ("all_on", (True, True), ([1, 2], [3, 4])),
+            ("empty_capture_rank", (True, False), ([], [3, 4])),
+            ("empty_off_rank", (True, False), ([1, 2], [])),
+            ("both_empty", (True, True), ([], [])),
+        )
+        for name, capture_flags, input_ids in cases:
+            with self.subTest(case=name):
+                model = _make_disaggregate_gemm_model(attn_dp_rank=(0, 1))
+                messages, outputs = _run_disaggregate_capture_protocol(
+                    model, input_ids, capture_flags, compute_dtype=torch.float16
+                )
+                self.assertEqual(model.capture_hidden_states, any(capture_flags))
+                self.assertEqual(
+                    model.capture_hidden_states_by_attn_rank, list(capture_flags)
+                )
+                for ids, capture, wire, output in zip(
+                    input_ids, capture_flags, messages, outputs
+                ):
+                    embedded = _Embedding()(torch.tensor(ids, dtype=torch.int32))
+                    layer0 = embedded + 1
+                    layer1 = layer0 + 2
+                    expected_final = layer1 * 10
+                    self.assertEqual(len(wire), 2 if capture else 1)
+                    self.assertTrue(all(t.is_contiguous() for t in wire))
+                    self.assertEqual(
+                        tuple(wire[-1].shape), (len(ids), 6 if capture else 2)
+                    )
+                    self.assertEqual(tuple(output.hidden_states.shape), (len(ids), 2))
+                    self.assertTrue(output.hidden_states.is_contiguous())
+                    self.assertEqual(output.hidden_states.dtype, torch.float16)
+                    torch.testing.assert_close(
+                        output.hidden_states, expected_final.half()
+                    )
+                    self.assertIsNone(output.capture_error)
+                    if capture:
+                        torch.testing.assert_close(
+                            wire[0],
+                            torch.tensor([CaptureStatus.PACKED], dtype=torch.int64),
+                        )
+                        expected_packed = torch.cat(
+                            (layer1, layer0, expected_final), dim=-1
+                        )
+                        torch.testing.assert_close(wire[1], expected_packed)
+                        self.assertEqual(
+                            tuple(output.captured_hidden_states.shape), (len(ids), 6)
+                        )
+                        torch.testing.assert_close(
+                            output.captured_hidden_states, expected_packed.half()
+                        )
+                    else:
+                        torch.testing.assert_close(wire[0], expected_final)
+                        self.assertIsNone(output.captured_hidden_states)
+
+    def test_disaggregate_final_tail_is_a_view_only_when_output_will_merge(
+        self,
+    ) -> None:
+        packed = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+        for output_will_merge in (False, True):
+            with self.subTest(output_will_merge=output_will_merge):
+                model = _make_disaggregate_attention_model()
+                model.config = SimpleNamespace(
+                    hidden_size=2,
+                    hidden_state_capture_layer_ids=[1, 0],
+                    compute_dtype=torch.float32,
+                )
+                model.layer_num = 0
+                model.attention_layers = nn.ModuleList()
+                with (
+                    patch(
+                        "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                        side_effect=_copy_recv_payloads(
+                            [
+                                torch.tensor([CaptureStatus.PACKED], dtype=torch.int64),
+                                packed,
+                            ]
+                        ),
+                    ) as recv_mock,
+                    patch("rtp_llm.models_py.model_desc.disaggregate_qwen3.send"),
+                ):
+                    (output,) = model.forward_micro_batch(
+                        [
+                            _make_inputs(
+                                [1, 2],
+                                True,
+                                micro_batch_output_will_merge=output_will_merge,
+                            )
+                        ]
+                    )
+                self.assertEqual(recv_mock.call_count, 2)
+                torch.testing.assert_close(output.hidden_states, packed[:, -2:])
+                torch.testing.assert_close(output.captured_hidden_states, packed)
+                self.assertIsNone(output.capture_error)
+                self.assertEqual(
+                    output.hidden_states.is_contiguous(), not output_will_merge
+                )
+                self.assertEqual(
+                    output.hidden_states.untyped_storage().data_ptr()
+                    == output.captured_hidden_states.untyped_storage().data_ptr(),
+                    output_will_merge,
+                )
+                if output_will_merge:
+                    merged = torch.empty((2, 2))
+                    merged.copy_(output.hidden_states)
+                    self.assertTrue(merged.is_contiguous())
+                    torch.testing.assert_close(merged, packed[:, -2:])
+
+    def test_disaggregate_capture_errors_notify_rank_and_preserve_serving(self) -> None:
+        for failure, expected_error in (
+            ("layer", "ValueError: layer capture failure"),
+            ("unconfigured", "hidden-state capture did not produce a payload"),
+        ):
+            with self.subTest(failure=failure):
+                model = _make_disaggregate_gemm_model(attn_dp_rank=(0, 1))
+                failure_patch = nullcontext()
+                if failure == "layer":
+                    failure_patch = patch.object(
+                        model._capture_context,
+                        "_canonical_layer",
+                        side_effect=ValueError("layer capture failure"),
+                    )
+                else:
+                    model.config.hidden_state_capture_layer_ids = []
+                    model._init_capture_context(
+                        model._capture_canonical_layer, model._capture_canonical_final
+                    )
+                input_ids = ([1, 2], [3, 4])
+                with (
+                    failure_patch,
+                    patch.object(
+                        model.norm, "forward", wraps=model.norm.forward
+                    ) as norm,
+                    self.assertLogs(level="WARNING") as logs,
+                ):
+                    messages, outputs = _run_disaggregate_capture_protocol(
+                        model, input_ids, (False, True)
+                    )
+                norm.assert_called_once()
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(expected_error, logs.output[0])
+                self.assertIn("attention_ranks=[0, 1]", logs.output[0])
+                self.assertIn("tokens=[2, 2]", logs.output[0])
+                self.assertEqual([len(wire) for wire in messages], [1, 2])
+                status, canonical = messages[1]
+                torch.testing.assert_close(
+                    status,
+                    torch.tensor([CaptureStatus.CAPTURE_DROPPED], dtype=torch.int64),
+                )
+                self.assertEqual(tuple(canonical.shape), (2, 2))
+                self.assertIsNone(outputs[0].capture_error)
+                self.assertEqual(
+                    outputs[1].capture_error,
+                    "FFN hidden-state capture dropped; see FFN service logs for details",
+                )
+                for ids, output, wire in zip(input_ids, outputs, messages):
+                    expected = (_Embedding()(torch.tensor(ids)) + 3) * 10
+                    torch.testing.assert_close(wire[-1], expected)
+                    torch.testing.assert_close(output.hidden_states, expected)
+                    self.assertIsNone(output.captured_hidden_states)
+
+                with self.assertNoLogs(level="WARNING"):
+                    off_messages, off_outputs = _run_disaggregate_capture_protocol(
+                        model, input_ids, (False, False)
+                    )
+                self.assertEqual([len(wire) for wire in off_messages], [1, 1])
+                for previous, output in zip(outputs, off_outputs):
+                    torch.testing.assert_close(
+                        output.hidden_states, previous.hidden_states
+                    )
+                    self.assertIsNone(output.captured_hidden_states)
+                    self.assertIsNone(output.capture_error)
+
+    def test_disaggregate_capture_failure_is_micro_batch_local(self) -> None:
         model = _make_disaggregate_gemm_model(attn_dp_rank=(0, 1))
-        model.capture_hidden_states_by_attn_rank = [False, False]
-        sent = []
+        model.micro_batch_size = 2
+        sent = {0: [], 1: []}
+        pack_impl = torch.cat
+        pack_calls = 0
 
-        def capture_send(tensor, rank, group):
-            self.assertTrue(torch.ops.aten.is_non_overlapping_and_dense.default(tensor))
-            sent.append((rank, tensor))
+        def fail_first_pack(*args, **kwargs):
+            nonlocal pack_calls
+            pack_calls += 1
+            if pack_calls == 1:
+                raise RuntimeError("first micro-batch pack failure")
+            return pack_impl(*args, **kwargs)
 
-        with patch(
-            "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
-            side_effect=_copy_recv_payloads(
-                [
-                    torch.tensor([2, 0], dtype=torch.int64),
-                    torch.tensor([2, 1], dtype=torch.int64),
-                    torch.tensor([1, 2], dtype=torch.int32),
-                    torch.tensor([3, 4], dtype=torch.int32),
-                ]
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                side_effect=_copy_recv_payloads(
+                    [
+                        torch.tensor([2, 1, 1], dtype=torch.int64),
+                        torch.tensor([1, 0, 0], dtype=torch.int64),
+                        torch.tensor([1, 2], dtype=torch.int32),
+                        torch.tensor([3], dtype=torch.int32),
+                        torch.tensor([4], dtype=torch.int32),
+                    ]
+                ),
             ),
-        ), patch(
-            "rtp_llm.models_py.model_desc.disaggregate_qwen3.send",
-            side_effect=capture_send,
+            patch(
+                "rtp_llm.models_py.model_desc.disaggregate_qwen3.send",
+                side_effect=lambda tensor, rank, group: sent[rank].append(
+                    tensor.clone()
+                ),
+            ),
+            patch.object(torch, "cat", side_effect=fail_first_pack),
+            self.assertLogs(level="WARNING") as logs,
         ):
             model.forward_micro_batch([])
+        self.assertEqual(pack_calls, 2)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("RuntimeError: first micro-batch pack failure", logs.output[0])
 
-        self.assertTrue(model.capture_hidden_states)
-        self.assertEqual(model.capture_hidden_states_by_attn_rank, [False, True])
-        self.assertEqual(len(sent), 6)
-        false_rank, false_payload = sent[-2]
-        true_rank, true_payload = sent[-1]
-        self.assertEqual((false_rank, true_rank), (0, 1))
-
-        embedded = _Embedding()(torch.tensor([1, 2, 3, 4], dtype=torch.int64))
-        layer0 = embedded + 1
-        layer1 = layer0 + 2
-        expected_false = (layer1 * 10)[:2]
-        expected_true = torch.cat((layer1, layer0, layer1 * 10), dim=-1)[2:]
-        torch.testing.assert_close(false_payload, expected_false)
-        torch.testing.assert_close(true_payload, expected_true)
-
-        attention_model = _make_disaggregate_attention_model()
-        attention_model.config = SimpleNamespace(
-            hidden_size=2,
-            hidden_state_capture_layer_ids=[1, 0],
-            compute_dtype=torch.float16,
-        )
-        with patch(
-            "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
-            side_effect=_copy_recv_payloads([false_payload, true_payload]),
+        for rank, input_ids, capture in (
+            (0, ([1, 2], [4]), True),
+            (1, ([3], []), False),
         ):
-            false_output = attention_model.recv_final_from_ffn_service(2, False)
-            true_output = attention_model.recv_final_from_ffn_service(2, True)
+            with self.subTest(rank=rank):
+                messages = sent[rank][4:]
+                self.assertEqual(len(messages), 4 if capture else 2)
+                attention_model = _make_disaggregate_attention_model()
+                attention_model.config = SimpleNamespace(
+                    hidden_size=2,
+                    hidden_state_capture_layer_ids=[1, 0],
+                    compute_dtype=torch.float32,
+                )
+                attention_model.layer_num = 0
+                attention_model.attention_layers = nn.ModuleList()
+                with (
+                    patch(
+                        "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                        side_effect=_copy_recv_payloads(messages),
+                    ) as recv_mock,
+                    patch("rtp_llm.models_py.model_desc.disaggregate_qwen3.send"),
+                ):
+                    outputs = attention_model.forward_micro_batch(
+                        [_make_inputs(ids, capture) for ids in input_ids]
+                    )
+                self.assertEqual(recv_mock.call_count, len(messages))
+                self.assertEqual(len(outputs), 2)
+                for ids, output in zip(input_ids, outputs):
+                    embedded = _Embedding()(torch.tensor(ids))
+                    torch.testing.assert_close(
+                        output.hidden_states, (embedded + 3) * 10
+                    )
+                if capture:
+                    self.assertEqual(
+                        outputs[0].capture_error,
+                        "FFN hidden-state capture dropped; see FFN service logs for details",
+                    )
+                    self.assertIsNone(outputs[0].captured_hidden_states)
+                    embedded = _Embedding()(torch.tensor([4]))
+                    torch.testing.assert_close(
+                        outputs[1].captured_hidden_states,
+                        torch.cat(
+                            (embedded + 3, embedded + 1, (embedded + 3) * 10), dim=-1
+                        ),
+                    )
+                    self.assertIsNone(outputs[1].capture_error)
+                else:
+                    for output in outputs:
+                        self.assertIsNone(output.capture_error)
+                        self.assertIsNone(output.captured_hidden_states)
 
-        self.assertEqual(tuple(false_output.shape), (2, 2))
-        self.assertEqual(tuple(true_output.shape), (2, 6))
-        torch.testing.assert_close(false_output, expected_false.half())
-        torch.testing.assert_close(true_output, expected_true.half())
+    def test_disaggregate_capture_protocol_rejects_invalid_status(self) -> None:
+        model = _make_disaggregate_attention_model()
+        model.config = SimpleNamespace(hidden_size=2, compute_dtype=torch.float32)
+        for status in (-1, 2):
+            with (
+                self.subTest(status=status),
+                patch(
+                    "rtp_llm.models_py.model_desc.disaggregate_qwen3.recv",
+                    side_effect=_copy_recv_payloads(
+                        [torch.tensor([status], dtype=torch.int64)]
+                    ),
+                ) as recv_mock,
+                self.assertRaisesRegex(
+                    Exception, "invalid hidden-state capture status"
+                ),
+            ):
+                model.recv_final_from_ffn_service(2, True)
+            self.assertEqual(recv_mock.call_count, 1)
 
     def test_disaggregate_final_hidden_numeric_parity_capture_on_off(self) -> None:
         outputs = []
@@ -1459,7 +1964,7 @@ class HiddenStateCaptureTest(unittest.TestCase):
         model = _make_moe_model([1, 0])
         inputs = _make_inputs([1, 2], capture_hidden_states=True)
 
-        outputs = model.forward(inputs, fmha_impl=object()).hidden_states
+        outputs = model.forward(inputs, fmha_impl=object())
         embedded = model.embed_tokens(inputs.input_ids)
         layer0_hidden = embedded + 1
         layer0_residual = torch.full_like(embedded, 10)
@@ -1467,10 +1972,11 @@ class HiddenStateCaptureTest(unittest.TestCase):
         layer1_hidden = layer0_hidden + 2
         layer1_residual = layer0_residual + 20
         layer1 = layer1_hidden + layer1_residual
-        expected = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
+        expected_capture = torch.cat((layer1, layer0, layer1 * 10), dim=-1)
 
-        torch.testing.assert_close(outputs, expected)
-        self.assertEqual(tuple(outputs.shape), (2, 6))
+        torch.testing.assert_close(outputs.hidden_states, layer1 * 10)
+        torch.testing.assert_close(outputs.captured_hidden_states, expected_capture)
+        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_sparse_mla_tag_routing_preserves_capture_boundaries(self) -> None:
         for with_cache in (False, True):
@@ -1490,14 +1996,22 @@ class HiddenStateCaptureTest(unittest.TestCase):
                 for capture_hidden_states in (True, False):
                     with self.subTest(capture_hidden_states=capture_hidden_states):
                         inputs = _make_inputs([1, 2], capture_hidden_states)
-                        with patch.object(
-                            model.layers[0], "forward", wraps=model.layers[0].forward
-                        ) as layer0, patch.object(
-                            model.layers[1], "forward", wraps=model.layers[1].forward
-                        ) as layer1, patch.object(
-                            model.norm, "forward", wraps=model.norm.forward
-                        ) as norm:
-                            outputs = model.forward(inputs, fmha_impl).hidden_states
+                        with (
+                            patch.object(
+                                model.layers[0],
+                                "forward",
+                                wraps=model.layers[0].forward,
+                            ) as layer0,
+                            patch.object(
+                                model.layers[1],
+                                "forward",
+                                wraps=model.layers[1].forward,
+                            ) as layer1,
+                            patch.object(
+                                model.norm, "forward", wraps=model.norm.forward
+                            ) as norm,
+                        ):
+                            outputs = model.forward(inputs, fmha_impl)
 
                         for layer_idx, layer in enumerate((layer0, layer1)):
                             layer.assert_called_once()
@@ -1517,15 +2031,15 @@ class HiddenStateCaptureTest(unittest.TestCase):
                         boundary0 = embedded + 11
                         boundary1 = embedded + 33
                         expected = boundary1 * 10
+                        torch.testing.assert_close(outputs.hidden_states, expected)
                         if capture_hidden_states:
-                            expected = torch.cat(
-                                (boundary1, boundary0, expected), dim=-1
+                            torch.testing.assert_close(
+                                outputs.captured_hidden_states,
+                                torch.cat((boundary1, boundary0, expected), dim=-1),
                             )
-                        torch.testing.assert_close(outputs, expected)
-                        self.assertEqual(
-                            tuple(outputs.shape),
-                            (2, 6 if capture_hidden_states else 2),
-                        )
+                        else:
+                            self.assertIsNone(outputs.captured_hidden_states)
+                        self.assertEqual(tuple(outputs.hidden_states.shape), (2, 2))
 
     def test_sparse_mla_capture_rejects_invalid_fmha_tags(self) -> None:
         model = _make_moe_model([1, 0])
@@ -1537,9 +2051,12 @@ class HiddenStateCaptureTest(unittest.TestCase):
             {"default": object(), "wrong": object()},
             {"default": object(), "indexer_kv": object(), "extra": object()},
         ):
-            with self.subTest(fmha_impl=fmha_impl), patch.object(
-                model.layers[0], "forward", wraps=model.layers[0].forward
-            ) as layer:
+            with (
+                self.subTest(fmha_impl=fmha_impl),
+                patch.object(
+                    model.layers[0], "forward", wraps=model.layers[0].forward
+                ) as layer,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "exactly FMHA tags"):
                     model.forward(inputs, fmha_impl)
                 layer.assert_not_called()

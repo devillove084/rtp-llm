@@ -292,7 +292,10 @@ void registerPyOpDefs(pybind11::module& m) {
             "bert_embedding_inputs", &PyModelInputs::bert_embedding_inputs, "BERT embedding inputs structure")
         .def_readwrite("capture_hidden_states",
                        &PyModelInputs::capture_hidden_states,
-                       "Capture configured hidden states for this homogeneous target-prefill batch");
+                       "Capture configured hidden states for this homogeneous target-prefill batch")
+        .def_readwrite("micro_batch_output_will_merge",
+                       &PyModelInputs::micro_batch_output_will_merge,
+                       "The caller will copy canonical micro-batch rows into a final dense output");
 
     pybind11::class_<PyModelOutputs>(m, "PyModelOutputs")
         .def(pybind11::init<>(), "Default constructor")
@@ -301,7 +304,11 @@ void registerPyOpDefs(pybind11::module& m) {
              pybind11::arg("hidden_states"),
              pybind11::arg("mtp_target_hidden_states"),
              "Initialize with hidden states and speculative target features")
-        .def_readwrite("hidden_states", &PyModelOutputs::hidden_states, "Hidden states output tensor")
+        .def_readwrite("hidden_states", &PyModelOutputs::hidden_states, "Canonical hidden states output tensor")
+        .def_readwrite("captured_hidden_states",
+                       &PyModelOutputs::captured_hidden_states,
+                       "Optional packed hidden states for capture side path")
+        .def_readwrite("capture_error", &PyModelOutputs::capture_error, "Recoverable capture-side diagnostic")
         .def_readwrite("mtp_target_hidden_states",
                        &PyModelOutputs::mtp_target_hidden_states,
                        "Optional target features consumed by speculative decoding");

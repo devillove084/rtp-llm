@@ -197,24 +197,39 @@ PyWrappedModel::~PyWrappedModel() {
 }
 
 bool PyWrappedModel::shouldCaptureHiddenStates(const GptModelInputs& inputs) {
-    const bool capture_requested = inputs.capture_hidden_states && !inputs.warmup && !inputs.is_fake_stream
-                                   && hidden_state_capture_publisher_ != nullptr;
-    if (capture_requested) {
-        // The explicit capture request and capture configuration are identical on
-        // all TP ranks after the executor's existing input sync. Keep the
-        // Python/FFN packed-hidden shape stable even when TP0 has disabled store
-        // publishing.
-        (void)hidden_state_capture_publisher_->shouldPublish();
+    if (!inputs.capture_hidden_states || inputs.warmup || inputs.is_fake_stream || !hidden_state_capture_publisher_) {
+        return false;
     }
-    return capture_requested;
+
+    // Gather admits every candidate/reservation and tpSyncModelInputs broadcasts
+    // the root capture bit. Only that decision controls Python/FFN geometry.
+    // An owner failure or cancellation after admission may drop submission, but
+    // must not make TP ranks diverge or add another device-side consensus.
+    (void)hidden_state_capture_publisher_->shouldPublish();
+    return true;
 }
 
-HiddenStateCaptureStats PyWrappedModel::hiddenStateCaptureStats() const {
-    return hidden_state_capture_publisher_ ? hidden_state_capture_publisher_->stats() : HiddenStateCaptureStats{};
+HiddenStateCaptureReservationPtr PyWrappedModel::tryReserveHiddenStateCapture(int64_t request_id,
+                                                                              int64_t valid_tokens) {
+    return hidden_state_capture_publisher_ ? hidden_state_capture_publisher_->tryReserve(request_id, valid_tokens) :
+                                             nullptr;
 }
 
-std::optional<std::string> PyWrappedModel::takeDeferredHiddenStateCaptureError() {
-    return hidden_state_capture_publisher_ ? hidden_state_capture_publisher_->takeDeferredError() : std::nullopt;
+void PyWrappedModel::discardHiddenStateCapture(const GptModelInputs& inputs, const std::string& reason) {
+    // This cancellation is intentionally over the model-input request IDs. The
+    // normal gather gate admits capture only when every participating context
+    // stream is a candidate with a reservation; direct test callers must model
+    // the same reservation contract before setting capture_hidden_states.
+    RTP_LLM_LOG_WARNING("[PyWrappedModel] dropping hidden-state capture side path: %s", reason.c_str());
+    if (device_props_.tp_rank != 0 || !hidden_state_capture_publisher_ || !inputs.request_id.defined()
+        || !inputs.request_id.device().is_cpu() || inputs.request_id.scalar_type() != torch::kInt64
+        || inputs.request_id.layout() != torch::kStrided) {
+        return;
+    }
+    const auto request_ids = inputs.request_id.contiguous();
+    for (int64_t i = 0; i < request_ids.numel(); ++i) {
+        hidden_state_capture_publisher_->discardReserved(request_ids.data_ptr<int64_t>()[i]);
+    }
 }
 
 // Helper function to build PyAttentionInputs from GptModelInputs
@@ -681,13 +696,34 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         }
     }
 
-    auto micro_batch_plan  = planMicroBatches(inputs);
-    auto [split_inputs, _] = splitInputsIntoMicroBatches(inputs, micro_batch_plan);
+    // One host snapshot serves planning, token slicing and capture export only.
+    // Execution below restores slices of the original device lengths rather
+    // than sending this planning metadata through a second H2D copy.
+    std::optional<GptModelInputs> capture_planning_inputs;
+    const auto*                   planning_inputs = &inputs;
+    if (capture_hidden_states || inputs.input_lengths.is_cuda()) {
+        capture_planning_inputs.emplace(inputs);
+        // Planning itself reads CPU lengths, so this D2H is deliberately
+        // blocking. The owned snapshot also survives the asynchronous export.
+        auto host_lengths = torch::empty(inputs.input_lengths.sizes(),
+                                         inputs.input_lengths.options().device(torch::kCPU).pinned_memory(true));
+        host_lengths.copy_(inputs.input_lengths, /*non_blocking=*/false);
+        capture_planning_inputs->input_lengths = std::move(host_lengths);
+        planning_inputs                        = &*capture_planning_inputs;
+    }
+    auto micro_batch_plan  = planMicroBatches(*planning_inputs);
+    auto [split_inputs, _] = splitInputsIntoMicroBatches(*planning_inputs, micro_batch_plan);
     std::vector<PyModelInputs> input_list;
     input_list.reserve(split_inputs.size());
 
+    int64_t length_offset = 0;
     for (size_t i = 0; i < split_inputs.size(); ++i) {
-        const bool  is_real_micro_input   = split_inputs[i].kv_cache_kernel_block_id.defined();
+        const bool is_real_micro_input = split_inputs[i].kv_cache_kernel_block_id.defined();
+        if (is_real_micro_input && inputs.input_lengths.is_cuda()) {
+            const auto batch_size         = split_inputs[i].input_lengths.size(0);
+            split_inputs[i].input_lengths = inputs.input_lengths.narrow(0, length_offset, batch_size);
+            length_offset += batch_size;
+        }
         const auto& micro_inputs          = is_real_micro_input ? split_inputs[i] : split_inputs[0];
         auto        py_attn_inputs        = buildPyAttentionInputs(micro_inputs);
         auto        embedding_inputs      = buildPyEmbeddingInputs(micro_inputs);
@@ -717,9 +753,10 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
                                               py_attn_inputs,
                                               attention_inputs_by_tag,
                                               bert_embedding_inputs});
-        input_list.back().capture_hidden_states  = capture_hidden_states;
-        input_list.back().need_all_logits        = micro_inputs.need_all_logits;
-        input_list.back().need_all_hidden_states = micro_inputs.need_all_hidden_states;
+        input_list.back().capture_hidden_states         = capture_hidden_states;
+        input_list.back().micro_batch_output_will_merge = micro_batch_plan.enable;
+        input_list.back().need_all_logits               = micro_inputs.need_all_logits;
+        input_list.back().need_all_hidden_states        = micro_inputs.need_all_hidden_states;
         if (micro_inputs.engram_token_windows.defined()) {
             input_list.back().engram_token_windows = tensorHoldHostAndToCuda(micro_inputs.engram_token_windows);
         }
@@ -743,6 +780,8 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         py_model_outputs             = py_outputs_obj.cast<std::vector<PyModelOutputs>>();
     }
 
+    bool                       capture_valid = capture_hidden_states;
+    std::vector<torch::Tensor> capture_outputs;
     if (capture_hidden_states) {
         RTP_LLM_PROFILE_SCOPE("py_model.capture_microbatch_layout");
         std::string capture_layout_error;
@@ -752,42 +791,42 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         } else {
             int64_t total_rows = 0;
             for (size_t i = 0; i < py_model_outputs.size(); ++i) {
-                // A disabled plan still appends one canonical fake lane so the
-                // Python micro-batch entry point keeps its fixed two-lane shape.
-                // It aliases lane 0 and must not participate in capture layout
-                // validation or row accounting.
+                // The disabled plan appends a fake lane which aliases lane 0;
+                // it is not an independently captured request.
                 if (!split_inputs[i].kv_cache_kernel_block_id.defined()) {
                     continue;
                 }
-                const auto& output   = py_model_outputs[i].hidden_states;
-                capture_layout_error = hidden_state_capture_publisher_->validatePackedLayout(
-                    output,
-                    input_list[i].input_ids.numel(),
-                    input_list[i].input_ids.device(),
-                    "capture micro-batch output " + std::to_string(i));
+                const auto& output   = py_model_outputs[i];
+                capture_layout_error = output.capture_error.value_or("");
+                const auto packed    = output.captured_hidden_states.value_or(torch::Tensor());
+                if (capture_layout_error.empty()) {
+                    capture_layout_error = hidden_state_capture_publisher_->validatePackedLayout(
+                        packed,
+                        input_list[i].input_ids.numel(),
+                        input_list[i].input_ids.device(),
+                        "capture micro-batch output " + std::to_string(i));
+                }
                 if (!capture_layout_error.empty()) {
                     break;
                 }
-                total_rows += output.size(0);
+                capture_outputs.push_back(packed);
+                total_rows += packed.size(0);
             }
             if (capture_layout_error.empty() && total_rows != inputs.combo_tokens.size(0)) {
                 capture_layout_error = "capture micro-batch outputs contain " + std::to_string(total_rows)
                                        + " rows, expected " + std::to_string(inputs.combo_tokens.size(0));
             }
         }
-        if (!capture_layout_error.empty()) {
-            hidden_state_capture_publisher_->rejectLayout(std::move(capture_layout_error));
-            cache_store_write_cycle.finish();
-            const auto fallback_device =
-                input_list.empty() ? c10::Device(c10::DeviceType::CUDA) : input_list.front().input_ids.device();
-            auto fallback_last_hidden = hidden_state_capture_publisher_->makeFallback(
-                torch::Tensor(), inputs.combo_tokens.numel(), fallback_device);
-            return callForwardPostLayers(fallback_last_hidden, inputs, true, fallback_last_hidden.size(0));
+        capture_valid = capture_layout_error.empty();
+        if (!capture_valid) {
+            capture_outputs.clear();
+            hidden_state_capture_publisher_->rejectLayout(capture_layout_error);
+            discardHiddenStateCapture(inputs, capture_layout_error);
         }
     }
 
     RTP_LLM_CHECK_WITH_INFO(py_model_outputs.size() == input_list.size(),
-                            "py_model_outputs.size:%d != micro_batch_inputs.size:%d",
+                            "canonical output count %d must match micro-batch input count %d",
                             py_model_outputs.size(),
                             input_list.size());
 
@@ -805,9 +844,6 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
         RTP_LLM_PROFILE_SCOPE("py_model.forwardMicroBatched(merge)");
         size_t total_tokens = inputs.combo_tokens.size(0);
         size_t hidden_size  = description_.attention_conf.head_num * description_.attention_conf.size_per_head;
-        if (capture_hidden_states) {
-            hidden_size = static_cast<size_t>(py_model_outputs[0].hidden_states.size(1));
-        }
         hidden_states =
             torch::empty({(int64_t)total_tokens, (int64_t)hidden_size},
                          torch::TensorOptions(dataTypeToTorchType(description_.data_type)).device(torch::kCUDA));
@@ -834,18 +870,19 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
 
     RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
 
-    if (capture_hidden_states) {
-        auto last_hidden_states = hidden_state_capture_publisher_->publish(hidden_states,
-                                                                           inputs.combo_tokens,
-                                                                           inputs.input_lengths,
-                                                                           inputs.request_id,
-                                                                           inputs.combo_tokens.numel(),
-                                                                           "captured hidden-state",
-                                                                           input_list.front().input_ids.device());
-        return callForwardPostLayers(last_hidden_states, inputs, true, last_hidden_states.size(0));
+    if (capture_valid && !capture_outputs.empty() && device_props_.tp_rank == 0) {
+        const auto packed = capture_outputs.size() == 1 ? capture_outputs.front() : torch::cat(capture_outputs, 0);
+        if (!hidden_state_capture_publisher_->trySubmit(packed,
+                                                        inputs.combo_tokens,
+                                                        planning_inputs->input_lengths,
+                                                        inputs.request_id,
+                                                        inputs.combo_tokens.numel(),
+                                                        "captured hidden-state")) {
+            discardHiddenStateCapture(inputs, "capture publication was not admitted");
+        }
     }
     // Python forward_micro_batch already applies the final normalization.
-    // Skip the C++ final layernorm so non-capture hidden states are not normalized twice.
+    // Skip the C++ final layernorm so canonical hidden states are not normalized twice.
     return callForwardPostLayers(hidden_states, inputs, true);
 }
 
@@ -1002,15 +1039,18 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         }
     } flag_guard{prepared_attention_inputs_};
 
-    if (hidden_state_capture_publisher_) {
-        hidden_state_capture_publisher_->beginForward();
-    }
     DevicePerfWrapper wrapper(enable_device_perf_, "py model forward");
     holdInputsHostBuffers(inputs);
     const bool capture_hidden_states = shouldCaptureHiddenStates(inputs);
     const auto capture_input_ids     = capture_hidden_states ? inputs.combo_tokens : torch::Tensor();
 
     const bool has_context_request = inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
+    // Capture metadata must be CPU-visible to the worker, but device-input
+    // mode may have moved input_lengths to CUDA. For non-CP capture, stage
+    // it asynchronously on the producer stream; the packed capture event
+    // recorded by trySubmit() fences this copy before the worker reads it.
+    torch::Tensor capture_input_lengths = capture_hidden_states ? inputs.input_lengths : torch::Tensor();
+
     // Packed hidden-state collection is eager, not a generation-prefill graph attempt.
     GenerationPrefillCudaGraphStatus generation_prefill_cuda_graph_status =
         !capture_hidden_states && owns_generation_prefill_cuda_graph_ && !is_prefill_cuda_graph_mode_
@@ -1033,6 +1073,15 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             inputs.multimodal_features.has_value() && !inputs.multimodal_features->empty();
         if (int(device_props_.enable_layer_micro_batch) && supports_micro_batch_ && !has_multimodal_features) {
             return with_generation_prefill_cuda_graph_status(forwardMicroBatched(inputs, capture_hidden_states));
+        }
+        // Micro-batch planning above owns its own blocking host snapshot; do
+        // not stage a second unused D2H copy for that path.
+        if (capture_hidden_states && device_props_.tp_rank == 0
+            && !(device_props_.enable_prefill_cp && has_context_request)) {
+            auto host_lengths = torch::empty(capture_input_lengths.sizes(),
+                                             capture_input_lengths.options().device(torch::kCPU).pinned_memory(true));
+            host_lengths.copy_(capture_input_lengths, /*non_blocking=*/capture_input_lengths.is_cuda());
+            capture_input_lengths = std::move(host_lengths);
         }
         PyContextParallelParams cp_params;
         if (device_props_.enable_prefill_cp && has_context_request) {
@@ -1147,14 +1196,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             py_model_outputs = outputs.cast<PyModelOutputs>();
         }
 
-        if (capture_hidden_states) {
-            // Capture consumes the Python output directly. CP restoration below
-            // remains the sole distributed layout operation on this path, and
-            // publish() validates the restored/local packed tensor once before store.
-            hidden_states = py_model_outputs.hidden_states;
-        } else {
-            hidden_states = py_model_outputs.hidden_states.clone();
-        }
+        // The Python output is always canonical final hidden state. Capture is
+        // an optional packed side payload and must never replace this tensor.
+        hidden_states = py_model_outputs.hidden_states.clone();
 
         cache_store_write_cycle.finish();
 
@@ -1182,54 +1226,53 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             return with_generation_prefill_cuda_graph_status(attach_mtp_target_hidden_states(std::move(outputs)));
         }
         if (capture_hidden_states) {
-            auto        capture_input_lengths  = inputs.input_lengths;
             int64_t     capture_expected_rows  = capture_input_ids.numel();
             std::string capture_layout_context = "captured hidden-state";
+            auto        captured_hidden_states = py_model_outputs.captured_hidden_states.value_or(torch::Tensor());
+            std::string local_layout_error     = py_model_outputs.capture_error.value_or("");
+            if (local_layout_error.empty()) {
+                local_layout_error = hidden_state_capture_publisher_->validatePackedLayout(
+                    captured_hidden_states, token_ids.numel(), token_ids.device(), "captured hidden-state");
+            }
 
-            // Every TP rank must agree before any rank publishes or consumes a
-            // fallback. This is intentionally the single capture-layout
-            // collective for this forward: CP validates its rank-local output
-            // here and restores it only after the status has been reduced;
-            // non-CP uses the same mechanism instead of letting a non-owner
-            // silently return a zero fallback while TP0 publishes.
+            // All TP ranks must agree on whether the optional payload can be
+            // restored. This collective gates only the side path; canonical
+            // hidden/LM-head/sampler execution continues on every rank.
+            bool capture_valid = false;
             {
                 RTP_LLM_PROFILE_SCOPE("py_model.capture_layout_status");
-                auto local_layout_error = hidden_state_capture_publisher_->validatePackedLayout(
-                    hidden_states, token_ids.numel(), token_ids.device(), "captured hidden-state");
                 auto layout_status =
                     torch::tensor({local_layout_error.empty() ? int32_t{1} : int32_t{0}},
                                   torch::TensorOptions().dtype(torch::kInt32).device(token_ids.device()));
                 if (device_props_.tp_size > 1) {
                     layout_status = execAllReduce({layout_status, ReduceOp::Min, false, ParallelMode::TP}).buffer;
                 }
-                if (!local_layout_error.empty() || layout_status.item<int32_t>() == 0) {
-                    if (local_layout_error.empty()) {
-                        local_layout_error = "captured hidden-state layout contract violation on another TP rank";
-                    }
-                    hidden_state_capture_publisher_->rejectLayout(std::move(local_layout_error));
-                    auto fallback_last_hidden = hidden_state_capture_publisher_->makeFallback(
-                        hidden_states, capture_input_ids.numel(), token_ids.device());
-                    return with_generation_prefill_cuda_graph_status(attach_mtp_target_hidden_states(
-                        callForwardPostLayers(fallback_last_hidden, inputs, true, fallback_last_hidden.size(0))));
+                capture_valid = local_layout_error.empty() && layout_status.item<int32_t>() != 0;
+            }
+            if (!capture_valid) {
+                if (local_layout_error.empty()) {
+                    local_layout_error = "captured hidden-state layout contract violation on another TP rank";
+                }
+                hidden_state_capture_publisher_->rejectLayout(local_layout_error);
+                discardHiddenStateCapture(inputs, local_layout_error);
+            } else {
+                if (device_props_.enable_prefill_cp && has_context_request) {
+                    RTP_LLM_PROFILE_SCOPE("py_model.capture_cp_restore");
+                    capture_expected_rows = static_cast<int64_t>(
+                        context_parallel_processor_->handleOutputs(captured_hidden_states, inputs, cp_params));
+                    capture_layout_context = "context parallel restored captured hidden-state";
+                    capture_input_lengths  = cp_params.prefill_actual_input_lengths_cpu;
+                }
+                if (device_props_.tp_rank == 0
+                    && !hidden_state_capture_publisher_->trySubmit(captured_hidden_states,
+                                                                   capture_input_ids,
+                                                                   capture_input_lengths,
+                                                                   inputs.request_id,
+                                                                   capture_expected_rows,
+                                                                   capture_layout_context)) {
+                    discardHiddenStateCapture(inputs, "capture publication was not admitted");
                 }
             }
-
-            if (device_props_.enable_prefill_cp && has_context_request) {
-                RTP_LLM_PROFILE_SCOPE("py_model.capture_cp_restore");
-                capture_expected_rows =
-                    static_cast<int64_t>(context_parallel_processor_->handleOutputs(hidden_states, inputs, cp_params));
-                capture_layout_context = "context parallel restored captured hidden-state";
-                capture_input_lengths  = cp_params.prefill_actual_input_lengths_cpu;
-            }
-            auto last_hidden_states = hidden_state_capture_publisher_->publish(hidden_states,
-                                                                               capture_input_ids,
-                                                                               capture_input_lengths,
-                                                                               inputs.request_id,
-                                                                               capture_expected_rows,
-                                                                               capture_layout_context,
-                                                                               token_ids.device());
-            return with_generation_prefill_cuda_graph_status(attach_mtp_target_hidden_states(
-                callForwardPostLayers(last_hidden_states, inputs, true, last_hidden_states.size(0))));
         }
         if (device_props_.enable_prefill_cp && has_context_request) {
             if (!inputs.need_all_logits && !inputs.need_all_hidden_states) {
@@ -1246,13 +1289,13 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
     } catch (const py::error_already_set& e) {
         RTP_LLM_LOG_ERROR("Python error during forward call on Python instance: %s", e.what());
-        throw std::runtime_error(std::string("pybind11 error during forward call on Python instance: ") + e.what());
+        throw;
     } catch (const std::exception& e) {
         RTP_LLM_LOG_ERROR("C++ error during forward call on Python instance: %s", e.what());
-        throw std::runtime_error(std::string("C++ error during forward call on Python instance: ") + e.what());
+        throw;
     } catch (...) {
         RTP_LLM_LOG_ERROR("An unknown error occurred during forward call on Python instance.");
-        throw std::runtime_error("An unknown error occurred during forward call on Python instance.");
+        throw;
     }
 }
 
