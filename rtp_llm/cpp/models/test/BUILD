@@ -141,7 +141,11 @@ py_test(
 py_test(
     name = "pywrapped_model_cache_store_integration_test",
     srcs = ["pywrapped_model_cache_store_integration_test.py"],
-    data = [":th_pywrapped_model_cache_store_integration_test"],
+    data = [
+        ":th_pywrapped_model_cache_store_integration_test",
+        "//rtp_llm/cpp/models:capture_publisher_test_source",
+        "//rtp_llm/cpp/normal_engine:capture_lifecycle_test_sources",
+    ],
     deps = pywrapped_model_test_deps,
     env = {"TEST_USING_DEVICE": "CUDA"},
     exec_properties = {"gpu": "L20_CU13"},
@@ -152,7 +156,11 @@ py_test(
     name = "pywrapped_model_cache_store_integration_test_rocm",
     main = "pywrapped_model_cache_store_integration_test.py",
     srcs = ["pywrapped_model_cache_store_integration_test.py"],
-    data = [":th_pywrapped_model_cache_store_integration_test"],
+    data = [
+        ":th_pywrapped_model_cache_store_integration_test",
+        "//rtp_llm/cpp/models:capture_publisher_test_source",
+        "//rtp_llm/cpp/normal_engine:capture_lifecycle_test_sources",
+    ],
     deps = pywrapped_model_test_deps,
     env = {"TEST_USING_DEVICE": "ROCM"},
     tags = ["rocm"],

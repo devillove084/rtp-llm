@@ -1,6 +1,13 @@
 load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
+filegroup(
+    name = "capture_publisher_test_source",
+    testonly = True,
+    srcs = ["HiddenStateCapturePublisher.cc"],
+    visibility = ["//rtp_llm/cpp/models/test:__pkg__"],
+)
+
 # Sample infos - model sampling data structures
 cc_library(
     name = "sample_infos",
@@ -198,7 +205,7 @@ cc_library(
             "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
         ],
         "//conditions:default": [],
-    }),
+    }) + torch_deps(),
     visibility = ["//visibility:public"],
 )
 

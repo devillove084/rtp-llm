@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import pickle
 import re
 import sys
 import unittest
@@ -29,6 +30,169 @@ _PINNED_DEVICES = {
 
 def _jit_env(**values):
     return {**_PINNED_DEVICES, "MODEL_TYPE": "fake_model", **values}
+
+
+class FfnDisaggregateStartupContractTest(TestCase):
+    def test_real_parse_setup_and_native_round_trip(self):
+        for cp_method in (None, "ALL_GATHER", "PREFILL_CP"):
+            for world_rank in (0, 3):
+                with self.subTest(cp_method=cp_method, world_rank=world_rank):
+                    args = [
+                        "--enable_ffn_disaggregate",
+                        "false",
+                        "--tp_size",
+                        "2",
+                        "--dp_size",
+                        "2",
+                        "--world_size",
+                        "4",
+                        "--local_world_size",
+                        "4",
+                    ]
+                    if cp_method is not None:
+                        args.extend(["--cp_rotate_method", cp_method])
+                    with patch.dict(os.environ, _PINNED_DEVICES, clear=True):
+                        configs = setup_args(args)
+                    config = configs.parallelism_config
+                    set_parallelism_config(
+                        config,
+                        world_rank=world_rank,
+                        py_ffn_disaggregate_config=configs.ffn_disaggregate_config,
+                        py_prefill_cp_config=configs.prefill_cp_config,
+                    )
+                    self.assertIs(
+                        config.ffn_disaggregate_config.enable_ffn_disaggregate, False
+                    )
+                    self.assertEqual(
+                        (config.tp_size, config.dp_size, config.ep_size), (2, 2, 4)
+                    )
+                    self.assertEqual(config.local_rank, world_rank)
+                    self.assertEqual(config.tp_rank, world_rank % 2)
+                    self.assertEqual(config.dp_rank, world_rank // 2)
+                    self.assertEqual(config.ep_rank, world_rank)
+                    self.assertEqual(
+                        (config.ffn_tp_size, config.ffn_tp_rank), (2, world_rank % 2)
+                    )
+                    self.assertEqual(
+                        config.prefill_cp_config.method,
+                        configs.prefill_cp_config.method,
+                    )
+                    attention_tp = 1 if cp_method == "ALL_GATHER" else 2
+                    self.assertEqual(config.get_attn_tp_size(), attention_tp)
+                    self.assertEqual(config.get_ffn_tp_size(), attention_tp)
+
+                    restored = pickle.loads(pickle.dumps(config))
+                    self.assertIs(
+                        restored.ffn_disaggregate_config.enable_ffn_disaggregate, False
+                    )
+                    self.assertEqual(restored.world_rank, world_rank)
+                    self.assertEqual(
+                        restored.prefill_cp_config.method,
+                        config.prefill_cp_config.method,
+                    )
+                    configs.parallelism_config = restored
+                    self.assertIs(
+                        configs.ffn_disaggregate_config,
+                        restored.ffn_disaggregate_config,
+                    )
+
+    def test_existing_positional_cp_and_optional_ffn_calls(self):
+        for pass_ffn in (False, True):
+            with self.subTest(pass_ffn=pass_ffn):
+                configs = PyEnvConfigs()
+                configs.prefill_cp_config.method = CPRotateMethod.ALL_GATHER
+                kwargs = {"py_ffn_disaggregate_config": None} if pass_ffn else {}
+                set_parallelism_config(
+                    configs.parallelism_config, 0, configs.prefill_cp_config, **kwargs
+                )
+                self.assertIs(
+                    configs.ffn_disaggregate_config.enable_ffn_disaggregate, False
+                )
+                self.assertEqual(
+                    configs.parallelism_config.prefill_cp_config.method,
+                    CPRotateMethod.ALL_GATHER,
+                )
+
+    def test_dp1_tp1_cp_off_legacy_then_launcher_keyword_call(self):
+        for args in (None, [], ["--enable_ffn_disaggregate", "false"]):
+            with self.subTest(args=args), patch.dict(
+                os.environ, _PINNED_DEVICES, clear=True
+            ), patch.object(sys, "argv", ["server"]):
+                configs = setup_args(args)
+                config = configs.parallelism_config
+                # setup_default_args uses the legacy call before TorchSpec sets its rank.
+                set_parallelism_config(
+                    config, py_prefill_cp_config=configs.prefill_cp_config
+                )
+                set_parallelism_config(
+                    config,
+                    world_rank=0,
+                    py_ffn_disaggregate_config=configs.ffn_disaggregate_config,
+                    py_prefill_cp_config=configs.prefill_cp_config,
+                )
+                self.assertIs(
+                    configs.ffn_disaggregate_config, config.ffn_disaggregate_config
+                )
+                self.assertIs(config.ffn_disaggregate_config.enable_ffn_disaggregate, False)
+                self.assertEqual(config.prefill_cp_config.method, CPRotateMethod.DISABLED)
+                for field in (
+                    "world_size",
+                    "tp_size",
+                    "dp_size",
+                    "ep_size",
+                    "local_world_size",
+                    "ffn_tp_size",
+                ):
+                    with self.subTest(field=field):
+                        self.assertEqual(getattr(config, field), 1)
+                for field in (
+                    "world_rank",
+                    "local_rank",
+                    "tp_rank",
+                    "dp_rank",
+                    "ep_rank",
+                    "ffn_tp_rank",
+                ):
+                    with self.subTest(field=field):
+                        self.assertEqual(getattr(config, field), 0)
+                self.assertEqual(config.get_attn_tp_size(), 1)
+                self.assertEqual(config.get_ffn_tp_size(), 1)
+
+    def test_enabled_keyword_is_rejected_before_rank_mutation(self):
+        class EnabledConfig:
+            enable_ffn_disaggregate = True
+
+        configs = PyEnvConfigs()
+        config = configs.parallelism_config
+        config.world_rank = 7
+        config.tp_rank = 3
+        fields = (
+            "world_rank",
+            "local_rank",
+            "tp_rank",
+            "dp_rank",
+            "ep_rank",
+            "ffn_tp_rank",
+            "local_world_size",
+            "ep_size",
+            "ffn_tp_size",
+        )
+        before = tuple(getattr(config, field) for field in fields)
+        with self.assertRaisesRegex(
+            ValueError, "enable_ffn_disaggregate=true is unsupported"
+        ):
+            set_parallelism_config(
+                config, world_rank=0, py_ffn_disaggregate_config=EnabledConfig()
+            )
+        self.assertEqual(tuple(getattr(config, field) for field in fields), before)
+        self.assertIs(config.ffn_disaggregate_config.enable_ffn_disaggregate, False)
+
+    def test_unknown_keyword_is_not_swallowed(self):
+        configs = PyEnvConfigs()
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+            set_parallelism_config(
+                configs.parallelism_config, py_ffn_disaggregate_config_unknown=None
+            )
 
 
 class ServerConfigPortLayoutTest(TestCase):

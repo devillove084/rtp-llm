@@ -19,6 +19,8 @@
 策略：Python 侧硬编码期望值 + C++ 侧 static_assert，无需解析源码。
 """
 
+import copy
+import json
 import logging
 import unittest
 from types import SimpleNamespace
@@ -44,7 +46,162 @@ from rtp_llm.openai.api_datatype import ChatCompletionRequest
 from rtp_llm.structure.request_extractor import RequestExtractor
 
 
+class TestCaptureHiddenStatesMigration(unittest.TestCase):
+    _migration_error = (
+        "export_hidden_states.*use capture_hidden_states.*"
+        "max_new_tokens > 0.*reuse_cache=False"
+    )
+
+    @staticmethod
+    def _legacy_values():
+        for max_new_tokens in (0, 7):
+            for legacy in (False, True):
+                for canonical in (None, False, True):
+                    values = {
+                        "max_new_tokens": max_new_tokens,
+                        "reuse_cache": False,
+                        "stop_words_list": [[1, 2]],
+                        "unknown_historical_key": {"keep": [3]},
+                        "export_hidden_states": legacy,
+                    }
+                    if canonical is not None:
+                        values["capture_hidden_states"] = canonical
+                    yield values
+
+    def test_legacy_key_is_rejected_by_construction_paths(self):
+        for method in ("constructor", "model_validate", "model_validate_json"):
+            for values in self._legacy_values():
+                with self.subTest(method=method, values=values):
+                    before = copy.deepcopy(values)
+                    with self.assertRaisesRegex(
+                        ValidationError, self._migration_error
+                    ):
+                        if method == "constructor":
+                            GenerateConfig(**values)
+                        elif method == "model_validate_json":
+                            GenerateConfig.model_validate_json(json.dumps(values))
+                        else:
+                            GenerateConfig.model_validate(values)
+                    self.assertEqual(values, before)
+
+    def test_legacy_key_is_rejected_by_updates_atomically(self):
+        for method in ("update", "update_and_pop"):
+            for values in self._legacy_values():
+                with self.subTest(method=method, values=values):
+                    config = GenerateConfig(max_new_tokens=3, reuse_cache=True)
+                    config._diverge_depth_warned = True
+                    config._ban_auto_downgraded = True
+                    before = config.model_copy(deep=True)
+                    original = copy.deepcopy(values)
+                    with self.assertRaisesRegex(
+                        FtRuntimeException, self._migration_error
+                    ) as ctx:
+                        getattr(config, method)(values)
+                    self.assertEqual(
+                        ctx.exception.exception_type,
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    )
+                    self.assertEqual(config, before)
+                    self.assertEqual(config.model_fields_set, before.model_fields_set)
+                    self.assertEqual(values, original)
+
+    def test_canonical_construction_preserves_unknown_key_compatibility(self):
+        self.assertNotIn("export_hidden_states", GenerateConfig.model_fields)
+        for method in ("constructor", "model_validate", "model_validate_json"):
+            for max_new_tokens in (0, 7):
+                for enabled in (False, True):
+                    with self.subTest(
+                        method=method, max_new_tokens=max_new_tokens, enabled=enabled
+                    ):
+                        values = {
+                            "max_new_tokens": max_new_tokens,
+                            "capture_hidden_states": enabled,
+                            "reuse_cache": False,
+                            "unknown_historical_key": {"keep": [3]},
+                        }
+                        original = copy.deepcopy(values)
+                        if method == "constructor":
+                            config = GenerateConfig(**values)
+                        elif method == "model_validate_json":
+                            config = GenerateConfig.model_validate_json(json.dumps(values))
+                        else:
+                            config = GenerateConfig.model_validate(values)
+                        self.assertEqual(config.capture_hidden_states, enabled)
+                        self.assertEqual(config.max_new_tokens, max_new_tokens)
+                        self.assertFalse(config.reuse_cache)
+                        self.assertNotIn("unknown_historical_key", config.model_dump())
+                        self.assertNotIn("export_hidden_states", config.model_dump())
+                        self.assertEqual(values, original)
+
+    def test_canonical_updates_preserve_unknown_key_compatibility(self):
+        for method in ("update", "update_and_pop"):
+            for max_new_tokens in (0, 7):
+                for enabled in (False, True):
+                    with self.subTest(
+                        method=method, max_new_tokens=max_new_tokens, enabled=enabled
+                    ):
+                        config = GenerateConfig(max_new_tokens=3)
+                        values = {
+                            "max_new_tokens": max_new_tokens,
+                            "capture_hidden_states": enabled,
+                            "reuse_cache": False,
+                            "unknown_historical_key": {"keep": [3]},
+                        }
+                        original = copy.deepcopy(values)
+                        remaining = getattr(config, method)(values)
+                        self.assertEqual(config.capture_hidden_states, enabled)
+                        self.assertEqual(config.max_new_tokens, max_new_tokens)
+                        self.assertFalse(config.reuse_cache)
+                        if method == "update_and_pop":
+                            self.assertEqual(
+                                remaining,
+                                {"unknown_historical_key": {"keep": [3]}},
+                            )
+                        else:
+                            self.assertIsNone(remaining)
+                        self.assertEqual(values, original)
+
+
 class TestPrefillOnlyGenerateConfig(unittest.TestCase):
+
+    def test_capture_hidden_states_is_independent_of_response_and_prefill_mode(self):
+        self.assertNotIn("export_hidden_states", GenerateConfig.model_fields)
+        for max_new_tokens in (0, 7):
+            with self.subTest(max_new_tokens=max_new_tokens):
+                default = GenerateConfig(max_new_tokens=max_new_tokens)
+                self.assertFalse(default.capture_hidden_states)
+                for enabled in (False, True):
+                    config = GenerateConfig(
+                        max_new_tokens=max_new_tokens,
+                        capture_hidden_states=enabled,
+                        reuse_cache=False,
+                    )
+                    config.validate()
+                    restored = GenerateConfig.model_validate_json(
+                        config.model_dump_json()
+                    )
+                    self.assertEqual(restored.capture_hidden_states, enabled)
+                    self.assertEqual(restored.max_new_tokens, max_new_tokens)
+                    self.assertFalse(restored.reuse_cache)
+                    self.assertFalse(restored.return_hidden_states)
+                    self.assertFalse(restored.return_all_hidden_states)
+                    self.assertFalse(restored.return_logits)
+
+    def test_update_and_pop_preserves_capture_hidden_states(self):
+        config = GenerateConfig(max_new_tokens=7)
+        self.assertEqual(
+            config.update_and_pop(
+                {"capture_hidden_states": True, "reuse_cache": False}
+            ),
+            {},
+        )
+        config.update({"max_new_tokens": 0})
+        self.assertTrue(config.capture_hidden_states)
+        self.assertFalse(config.reuse_cache)
+        self.assertTrue(config.is_prefill_only())
+        config.update({"capture_hidden_states": False})
+        self.assertFalse(config.capture_hidden_states)
+
     def test_prefill_only_preserves_cache_setting(self):
         config = GenerateConfig(max_new_tokens=0, reuse_cache=True)
 

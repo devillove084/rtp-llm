@@ -1,6 +1,16 @@
 load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
+filegroup(
+    name = "capture_lifecycle_test_sources",
+    testonly = True,
+    srcs = [
+        "NormalEngine.cc",
+        "NormalEngine.h",
+    ],
+    visibility = ["//rtp_llm/cpp/models/test:__pkg__"],
+)
+
 cc_library(
     name = "normal_engine",
     hdrs = glob([
