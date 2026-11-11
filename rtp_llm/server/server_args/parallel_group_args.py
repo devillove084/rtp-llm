@@ -29,6 +29,15 @@ def parse_pp_stage_layer_counts(raw_value: str):
     return counts
 
 
+def _disabled_ffn_disaggregate(value):
+    enabled = str2bool(value)
+    if enabled:
+        raise argparse.ArgumentTypeError(
+            "enable_ffn_disaggregate=true is unsupported; only false is supported"
+        )
+    return enabled
+
+
 def init_parallel_group_args(
     parser, parallelism_config, prefill_cp_config
 ):
@@ -105,6 +114,14 @@ def init_parallel_group_args(
         type=int,
         default=1,
         help="在多节点分布式设置中，当前节点（Node）上使用的GPU设备数量。未设置时默认 1，多进程时由配置阶段按 min(cuda 数, world_size) 推导。",
+    )
+    parallel_group.add_argument(
+        "--enable_ffn_disaggregate",
+        env_name="ENABLE_FFN_DISAGGREGATE",
+        bind_to=(parallelism_config.ffn_disaggregate_config, "enable_ffn_disaggregate"),
+        type=_disabled_ffn_disaggregate,
+        default=False,
+        help="Disabled-only compatibility option. FFN disaggregation is not supported.",
     )
     parallel_group.add_argument(
         "--cp_rotate_method",

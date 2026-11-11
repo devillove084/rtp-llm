@@ -1308,6 +1308,45 @@ class Qwen4ExpModel(Qwen35Model):
         ):
             mark_projection_for_restart(weights.global_weights, projection)
 
+        # The draft's projected HC stream is not a target capture capability.
+        if not getattr(model_config, "is_mtp", False):
+            self._init_capture_context(
+                self._capture_canonical_layer, self._capture_canonical_final
+            )
+
+    def _capture_canonical_layer(
+        self,
+        hyper_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """This export defines aux_i as the existing mixer of full post-block HC.
+
+        This is a model-owned readout, not a claim of draft/training parity.
+        Deferred materialization is supplied by capture_layer_from; this hook
+        only projects the resulting Tensor, never the live pending injection.
+        """
+        if residual is not None:
+            raise ValueError(
+                "Qwen4 capture expects a materialized Tensor without residual"
+            )
+        hidden_states, _, _ = self.hyper_connection_mixer(hyper_states)
+        if (
+            hidden_states.ndim != 2
+            or hidden_states.shape != (hyper_states.shape[0], self.config.hidden_size)
+            or hidden_states.dtype != hyper_states.dtype
+            or hidden_states.device != hyper_states.device
+        ):
+            raise ValueError(
+                "Qwen4 canonical readout must preserve rows/dtype/device and H"
+            )
+        return hidden_states
+
+    def _capture_canonical_final(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        # The ordinary forward owns the only final mixer invocation.
+        return hidden_states
+
     def _ple_input_ids(self, inputs: PyModelInputs) -> torch.Tensor:
         return ple_input_ids(inputs, ple_eos_token_id(getattr(self, "config", None)))
 
@@ -1347,6 +1386,7 @@ class Qwen4ExpModel(Qwen35Model):
                 "qwen4_exp PLE target transaction must be finalized or rolled "
                 "back before the next forward"
             )
+        capture = self.capture_context(inputs.capture_hidden_states)
         attention_inputs = get_attention_inputs_value(inputs)
         has_side_caches = bool(self.ple_layers) or any(
             getattr(getattr(layer, "self_attn", None), "qsa_indexer", None) is not None
@@ -1368,11 +1408,12 @@ class Qwen4ExpModel(Qwen35Model):
                 if getattr(self, "_capture_mtp_target_hidden", False)
                 else None
             )
-            return (
-                PyModelOutputs(hidden, target_hidden)
-                if target_hidden is not None
-                else PyModelOutputs(hidden)
-            )
+            # No blocks ran: active capture reports missing layers, never exports
+            # the warmup embedding as a successful canonical payload.
+            outputs = capture.finalize(hidden)
+            if target_hidden is not None:
+                outputs.mtp_target_hidden_states = target_hidden
+            return outputs
         attention_inputs = prepare_state_cache_inputs(attention_inputs, self.kv_cache)
         side_cache_writers = (
             prepare_side_cache_store_writers(
@@ -1430,7 +1471,7 @@ class Qwen4ExpModel(Qwen35Model):
             else prepared_hyper
         )
 
-        pending_injection = None
+        pending_injection: tuple[torch.Tensor, torch.Tensor] | None = None
         defer_residual = (
             not is_cuda_graph
             and hyper_states.is_cuda
@@ -1514,6 +1555,16 @@ class Qwen4ExpModel(Qwen35Model):
                 hyper_states = decoder_layer(
                     hyper_states, layer_fmha_impl, **layer_kwargs
                 )
+            if capture.wants_layer(i):
+                if pending_injection is not None:
+                    capture.capture_layer_from(
+                        i,
+                        lambda hyper_states=hyper_states, pending=pending_injection: inject_into_residual(
+                            hyper_states, *pending
+                        ),
+                    )
+                else:
+                    capture.capture_layer(i, hyper_states)
             publish_layer_side_caches(self.kv_cache, i, side_cache_writers)
 
         # PLE and MTP/global-mixer consumers observe the materialized BF16 stream.
@@ -1528,6 +1579,7 @@ class Qwen4ExpModel(Qwen35Model):
         else:
             self._mtp_target_hidden_states = None
         hidden_states, _, _ = self.hyper_connection_mixer(hyper_states)
+        outputs = capture.finalize(hidden_states)
         if self._mtp_target_hidden_states is not None:
-            return PyModelOutputs(hidden_states, self._mtp_target_hidden_states)
-        return PyModelOutputs(hidden_states)
+            outputs.mtp_target_hidden_states = self._mtp_target_hidden_states
+        return outputs

@@ -19,6 +19,10 @@ class Executor {
 public:
     Executor() {};
     virtual absl::Status process(const ScheduleOutput& schedule_output, int64_t schedule_time_us = 0) = 0;
+    virtual HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t /*request_id*/,
+                                                                          int64_t /*valid_tokens*/) {
+        return {};
+    }
 
     /** Complete pending work on the engine loop thread before executor teardown. */
     virtual absl::Status finish() {

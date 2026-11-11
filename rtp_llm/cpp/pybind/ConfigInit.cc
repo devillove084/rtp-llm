@@ -1256,6 +1256,26 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("ffn_tp_nccl_port", &NcclCommConfig::ffn_tp_port)
         .def("to_string", &NcclCommConfig::to_string);
 
+    // Disabled-only compatibility with launchers that explicitly pass false.
+    py::class_<FfnDisAggregateConfig>(m, "FfnDisAggregateConfig")
+        .def(py::init<>())
+        .def_property("enable_ffn_disaggregate",
+                      &FfnDisAggregateConfig::get_enable_ffn_disaggregate,
+                      &FfnDisAggregateConfig::set_enable_ffn_disaggregate)
+        .def("to_string", &FfnDisAggregateConfig::to_string)
+        .def(py::pickle(
+            [](const FfnDisAggregateConfig& self) {
+                return py::make_tuple(self.get_enable_ffn_disaggregate());
+            },
+            [](py::tuple t) {
+                if (t.size() != 1) {
+                    throw std::runtime_error("Invalid FfnDisAggregateConfig state!");
+                }
+                FfnDisAggregateConfig c;
+                c.set_enable_ffn_disaggregate(t[0].cast<bool>());
+                return c;
+            }));
+
     // Register ParallelismConfig
     py::class_<ParallelismConfig>(m, "ParallelismConfig")
         .def(py::init<>())
@@ -1275,6 +1295,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("ffn_tp_rank", &ParallelismConfig::ffn_tp_rank)
         .def_readwrite("use_ub_comm", &ParallelismConfig::use_ub_comm)
         .def_readwrite("role_type", &ParallelismConfig::role_type)
+        .def_readwrite("ffn_disaggregate_config", &ParallelismConfig::ffn_disaggregate_config)
         .def_readwrite("prefill_cp_config", &ParallelismConfig::prefill_cp_config)
         .def_readwrite("pp_stage_layer_counts", &ParallelismConfig::pp_stage_layer_counts)
         .def("to_string", &ParallelismConfig::to_string)
@@ -1297,7 +1318,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.dp_rank,
                                       self.ffn_tp_size,
                                       self.ffn_tp_rank,
-                                      int64_t(0),  // reserved slot: removed ffn_disaggregate_config
+                                      int64_t(0),  // keep the disabled-only FFN compatibility slot
                                       self.prefill_cp_config,
                                       self.use_ub_comm,
                                       self.role_type,
@@ -1323,7 +1344,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.dp_rank                 = t[10].cast<int64_t>();
                     c.ffn_tp_size             = t[11].cast<int64_t>();
                     c.ffn_tp_rank             = t[12].cast<int64_t>();
-                    (void)t[13].cast<int64_t>();  // reserved slot: removed ffn_disaggregate_config
+                    c.ffn_disaggregate_config.set_enable_ffn_disaggregate(t[13].cast<int64_t>() != 0);
                     c.prefill_cp_config       = t[14].cast<PrefillCPConfig>();
                     c.use_ub_comm             = t[15].cast<bool>();
                     if (t.size() >= 17) {
@@ -1988,6 +2009,14 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("hidden_size", &ModelConfig::hidden_size)
         .def_readwrite("hidden_state_capture_layer_ids", &ModelConfig::hidden_state_capture_layer_ids)
         .def_readwrite("hidden_state_capture_dtype", &ModelConfig::hidden_state_capture_dtype)
+        .def_readwrite("hidden_state_capture_max_inflight_samples",
+                       &ModelConfig::hidden_state_capture_max_inflight_samples)
+        .def_readwrite("hidden_state_capture_max_inflight_bytes", &ModelConfig::hidden_state_capture_max_inflight_bytes)
+        .def_readwrite("hidden_state_capture_max_inflight_tokens",
+                       &ModelConfig::hidden_state_capture_max_inflight_tokens)
+        .def_readwrite("hidden_state_capture_max_pending_batches",
+                       &ModelConfig::hidden_state_capture_max_pending_batches)
+        .def_readwrite("hidden_state_capture_poll_interval_ms", &ModelConfig::hidden_state_capture_poll_interval_ms)
         .def_readwrite("attn_config", &ModelConfig::attn_config)
         .def_readwrite("linear_attention_config", &ModelConfig::linear_attention_config)
         .def_readwrite("hybrid_attention_config", &ModelConfig::hybrid_attention_config)

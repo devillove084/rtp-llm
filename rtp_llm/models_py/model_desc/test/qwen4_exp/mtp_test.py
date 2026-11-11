@@ -12,6 +12,13 @@ from rtp_llm.models_py.model_desc.qwen4_exp_mtp import (
     normalize_mtp_decode_positions,
     normalize_mtp_prefill_positions,
 )
+from rtp_llm.models_py.model_desc.test.qwen4_exp.fixtures import (
+    _EPS,
+    _HC,
+    _HIDDEN,
+    _hc_weights,
+)
+from rtp_llm.models_py.modules.qwen4_exp.gated_residual import Qwen4GatedResidual
 from rtp_llm.ops import HybridAttentionType
 from rtp_llm.ops.compute_ops import PyAttentionInputs, PyCacheStoreInputs, PyModelInputs
 
@@ -232,35 +239,68 @@ class Qwen4ExpMTPInputProjectionTest(unittest.TestCase):
         self.assertEqual(Qwen4ExpMTPModel.cuda_graph_position_id_len_factor(draft), 3)
 
     def test_target_forward_exports_precollapse_rows_to_graph_output(self):
+        class Block(nn.Module):
+            layer_type = HybridAttentionType.LINEAR
+
+            def forward(self, hidden, *args, **kwargs):
+                return hidden
+
         inputs = PyModelInputs()
         inputs.attention_inputs = PyAttentionInputs()
-        embedding = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-        wide = torch.cat((embedding, embedding + 10), dim=-1)
+        inputs.input_ids = torch.arange(2, dtype=torch.int32)
+        embedding = torch.arange(2 * _HIDDEN, dtype=torch.float32).reshape(2, _HIDDEN)
+        wide = torch.cat([embedding + 10 * i for i in range(_HC)], dim=-1)
+        gamma, down, up, _ = _hc_weights(3)
+        mixer = Qwen4GatedResidual(gamma, down, up, None, hc_mult=_HC, norm_eps=_EPS)
         fields = dict(
+            config=SimpleNamespace(
+                hidden_size=_HIDDEN, hidden_state_capture_layer_ids=[0]
+            ),
             ple_layers={},
-            layers=[],
+            layers=nn.ModuleList([Block()]),
             kv_cache=None,
-            _capture_mtp_target_hidden=True,
             _ple_target_transaction=None,
             word_embedding=lambda _: embedding,
+            _try_fp8_hyper_embedding=lambda _: None,
             _build_attn_meta=lambda *_: None,
             _initial_hyper_states=lambda _: wide,
-            hyper_connection_mixer=lambda value: (value[:, :4], None, None),
+            hyper_connection_mixer=mixer,
         )
-
         model = Qwen4ExpModel.__new__(Qwen4ExpModel)
-        torch.nn.Module.__init__(model)
+        nn.Module.__init__(model)
         for name, value in fields.items():
             setattr(model, name, value)
-
-        outputs = Qwen4ExpModel.forward(model, inputs, object())
-        torch.testing.assert_close(outputs.hidden_states, embedding)
-        torch.testing.assert_close(outputs.mtp_target_hidden_states, wide)
-        self.assertEqual(outputs.mtp_target_hidden_states.data_ptr(), wide.data_ptr())
-
-        model._capture_mtp_target_hidden = False
-        outputs = Qwen4ExpModel.forward(model, inputs, object())
-        self.assertIsNone(outputs.mtp_target_hidden_states)
+        model._init_capture_context(
+            model._capture_canonical_layer, model._capture_canonical_final
+        )
+        for mtp in (False, True):
+            model._capture_mtp_target_hidden = mtp
+            inputs.capture_hidden_states = False
+            off = Qwen4ExpModel.forward(model, inputs, object())
+            inputs.capture_hidden_states = True
+            with patch.object(mixer, "forward", wraps=mixer.forward) as readout:
+                on = Qwen4ExpModel.forward(model, inputs, object())
+            self.assertEqual(readout.call_count, 2)
+            self.assertIsNone(on.capture_error)
+            self.assertIsNone(off.capture_error)
+            self.assertIsNone(off.captured_hidden_states)
+            torch.testing.assert_close(
+                on.hidden_states, off.hidden_states, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                on.captured_hidden_states,
+                torch.cat([off.hidden_states] * 2, dim=-1),
+                rtol=0,
+                atol=0,
+            )
+            if mtp:
+                self.assertIs(on.mtp_target_hidden_states, wide)
+                self.assertIs(off.mtp_target_hidden_states, wide)
+                self.assertIs(model._mtp_target_hidden_states, wide)
+            else:
+                self.assertIsNone(on.mtp_target_hidden_states)
+                self.assertIsNone(off.mtp_target_hidden_states)
+                self.assertIsNone(model._mtp_target_hidden_states)
 
     def test_two_projection_forward_matches_small_shape_reference(self):
         torch.manual_seed(11)

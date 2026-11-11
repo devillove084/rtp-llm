@@ -53,6 +53,15 @@ struct PrefillCPConfig {
     }
     std::string to_string() const;
 };
+// Startup compatibility only; no FFN service topology or execution support.
+struct FfnDisAggregateConfig {
+    bool get_enable_ffn_disaggregate() const {
+        return false;
+    }
+    void        set_enable_ffn_disaggregate(bool enabled);
+    std::string to_string() const;
+};
+
 struct ParallelismConfig {
     int64_t tp_size          = 1;
     int64_t ep_size          = 1;
@@ -78,6 +87,8 @@ struct ParallelismConfig {
 
     /** Main-model layer counts per stage; ignored by drafts and single-stage models. */
     std::vector<int64_t> pp_stage_layer_counts;
+
+    FfnDisAggregateConfig ffn_disaggregate_config;
 
     // Context Parallel configuration
     PrefillCPConfig prefill_cp_config;
