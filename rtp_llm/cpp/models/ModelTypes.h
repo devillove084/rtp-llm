@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/cache/BufferTypes.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
 #include <array>
@@ -235,6 +236,8 @@ private:
 };
 
 using HiddenStateCaptureReservationPtr = std::shared_ptr<HiddenStateCaptureReservation>;
+// Success must carry an active reservation; failures never represent an admitted request.
+using HiddenStateCaptureAdmissionResult = ErrorResult<HiddenStateCaptureReservationPtr>;
 
 class ModelBase {
 public:
@@ -245,9 +248,9 @@ public:
     virtual PPIntermediateTensors makePPWarmUpInputTensors(const GptModelInputs& inputs, bool enable_cp);
     virtual void                  releaseBuffers() {}
     virtual void                  prepareAttentionInputs(const GptModelInputs& inputs) {}
-    virtual HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t /*request_id*/,
-                                                                          int64_t /*valid_tokens*/) {
-        return {};
+    virtual HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t /*request_id*/,
+                                                                           int64_t /*valid_tokens*/) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "model does not support hidden-state capture"};
     }
 
     // Refresh only kv_cache_kernel_block_id-dependent state on a previously-

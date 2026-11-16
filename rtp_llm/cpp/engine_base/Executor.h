@@ -19,9 +19,9 @@ class Executor {
 public:
     Executor() {};
     virtual absl::Status process(const ScheduleOutput& schedule_output, int64_t schedule_time_us = 0) = 0;
-    virtual HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t /*request_id*/,
-                                                                          int64_t /*valid_tokens*/) {
-        return {};
+    virtual HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t /*request_id*/,
+                                                                           int64_t /*valid_tokens*/) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "executor does not support hidden-state capture"};
     }
 
     /** Complete pending work on the engine loop thread before executor teardown. */

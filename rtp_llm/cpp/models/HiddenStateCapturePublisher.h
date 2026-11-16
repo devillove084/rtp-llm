@@ -60,7 +60,7 @@ public:
     HiddenStateCapturePublisher(const HiddenStateCapturePublisher&)            = delete;
     HiddenStateCapturePublisher& operator=(const HiddenStateCapturePublisher&) = delete;
 
-    HiddenStateCaptureReservationPtr tryReserve(int64_t request_id, int64_t valid_tokens);
+    HiddenStateCaptureAdmissionResult tryReserve(int64_t request_id, int64_t valid_tokens);
     bool                             hasReservation(int64_t request_id) const;
     int64_t                          inflightSamples() const;
     int64_t                          inflightBytes() const;

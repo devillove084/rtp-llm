@@ -1547,9 +1547,9 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object         py_model,
                         if (id >= 0 && seen.insert(id).second) {
                             auto reservation =
                                 model.tryReserveHiddenStateCapture(id, lengths.data_ptr<int32_t>()[request]);
-                            admitted = static_cast<bool>(reservation) && admitted;
-                            if (reservation) {
-                                reservations.push_back(std::move(reservation));
+                            admitted = reservation.ok() && admitted;
+                            if (reservation.ok()) {
+                                reservations.push_back(std::move(reservation.value()));
                             }
                         } else {
                             admitted = false;
@@ -1837,11 +1837,11 @@ py::dict runGenerationPrefillCaptureScenario(py::object                         
                 for (int64_t request = 0; request < request_ids.numel(); ++request) {
                     auto reservation = model.tryReserveHiddenStateCapture(request_ids.data_ptr<int64_t>()[request],
                                                                           lengths.data_ptr<int32_t>()[request]);
-                    if (!reservation) {
+                    if (!reservation.ok()) {
                         inputs.capture_hidden_states = false;
                         break;
                     }
-                    reservations.push_back(std::move(reservation));
+                    reservations.push_back(std::move(reservation.value()));
                 }
             }
             const auto calls_before = py_model.attr("forward_calls").cast<int64_t>();
@@ -2129,6 +2129,12 @@ PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
     py::class_<Reservation, rtp_llm::HiddenStateCaptureReservationPtr>(m, "CaptureReservation")
         .def("cancel", &Reservation::cancel, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("active", &Reservation::active);
+    using Admission = rtp_llm::HiddenStateCaptureAdmissionResult;
+    py::class_<Admission>(m, "CaptureAdmission")
+        .def_property_readonly("ok", &Admission::ok)
+        .def_property_readonly("code", [](const Admission& result) { return static_cast<int>(result.status().code()); })
+        .def_property_readonly("message", [](const Admission& result) { return result.status().ToString(); })
+        .def_property_readonly("reservation", [](const Admission& result) { return result.value(); });
     py::class_<Publisher>(m, "CapturePublisher")
         .def(py::init([](int64_t            samples,
                          int64_t            bytes,

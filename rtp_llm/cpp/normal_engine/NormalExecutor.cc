@@ -57,9 +57,12 @@ NormalExecutor::~NormalExecutor() {
     cudaProfilerEnd();
 }
 
-HiddenStateCaptureReservationPtr NormalExecutor::tryReserveHiddenStateCapture(int64_t request_id,
-                                                                              int64_t valid_tokens) {
-    return model_ ? model_->tryReserveHiddenStateCapture(request_id, valid_tokens) : nullptr;
+HiddenStateCaptureAdmissionResult NormalExecutor::tryReserveHiddenStateCapture(int64_t request_id,
+                                                                               int64_t valid_tokens) {
+    if (!model_) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture model is unavailable"};
+    }
+    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens);
 }
 
 NormalExecutor::NormalExecutor(const EngineInitParams&                params,

@@ -42,7 +42,11 @@ import grpc
 import torch
 from grpc import StatusCode
 
-from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.config.exceptions import (
+    ExceptionCategory,
+    ExceptionType,
+    FtRuntimeException,
+)
 from rtp_llm.config.generate_config import (
     GenerateConfig,
     RoleAddr,
@@ -516,20 +520,29 @@ class ModelRpcClientTest(TestCase):
                     )
                     self.assertEqual(received.generate_config.is_streaming, streaming)
 
-    @staticmethod
-    def _make_batch_client(max_rpc_timeout_ms: int = 0) -> ModelRpcClient:
+    def _make_batch_client(
+        self, max_rpc_timeout_ms: int = 0, *, batch_call=None
+    ) -> ModelRpcClient:
         channel_pool = MagicMock()
         channel_pool.get = AsyncMock(return_value=MagicMock())
         with patch(
             "rtp_llm.cpp.model_rpc.model_rpc_client.GrpcHostChannelPool",
             return_value=channel_pool,
         ):
-            return ModelRpcClient(
+            client = ModelRpcClient(
                 addresses=["localhost:1234"],
                 client_config={},
                 max_rpc_timeout_ms=max_rpc_timeout_ms,
                 decode_entrance=False,
             )
+        if batch_call is not None:
+            patcher = patch(
+                "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub",
+                return_value=MagicMock(BatchGenerateCall=batch_call),
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return client
 
     def test_thinking_mode_values_match_proto_contract(self):
         cases = (
@@ -786,28 +799,38 @@ class ModelRpcClientTest(TestCase):
         stub.assert_not_called()
 
     def test_batch_generate_rejects_invalid_result_cardinality(self):
-        response = BatchGenerateOutputsPB()
-        client = self._make_batch_client()
-        stub = MagicMock()
-        stub.BatchGenerateCall = AsyncMock(return_value=response)
-        inputs = [
-            self._make_generate_input(GenerateConfig()),
-            self._make_generate_input(GenerateConfig()),
-        ]
-
-        with (
-            patch(
-                "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub",
-                return_value=stub,
-            ),
-            self.assertRaises(FtRuntimeException) as context,
-        ):
-            asyncio.run(client.batch_generate(inputs))
-
-        self.assertEqual(
-            context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
-        )
-        self.assertIn("received 0 results for 2 requests", context.exception.message)
+        for preserve, result_count in ((False, 0), (True, 1), (True, 3)):
+            with self.subTest(preserve=preserve, result_count=result_count):
+                inputs = (
+                    self._make_capture_batch_inputs(2)
+                    if preserve
+                    else [self._make_generate_input(GenerateConfig()) for _ in range(2)]
+                )
+                response = self._make_capture_batch_response(
+                    [ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE] * result_count
+                )
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response)
+                )
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.trans_output"
+                    ) as convert,
+                    self.assertRaises(FtRuntimeException) as context,
+                ):
+                    asyncio.run(
+                        client.batch_generate(
+                            inputs, preserve_capture_backpressure=preserve
+                        )
+                    )
+                self.assertEqual(
+                    context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
+                )
+                self.assertIn(
+                    f"received {result_count} results for 2 requests",
+                    context.exception.message,
+                )
+                convert.assert_not_called()
 
     def test_batch_generate_is_atomic_when_one_item_fails(self):
         response = BatchGenerateOutputsPB()
@@ -834,6 +857,263 @@ class ModelRpcClientTest(TestCase):
 
         self.assertEqual(context.exception.exception_type, ExceptionType.INVALID_PARAMS)
         self.assertIn("batch item 1 failed", context.exception.message)
+
+    def _make_capture_batch_inputs(self, count):
+        inputs = [
+            self._make_generate_input(
+                GenerateConfig(
+                    max_new_tokens=0, capture_hidden_states=True, reuse_cache=False
+                )
+            )
+            for _ in range(count)
+        ]
+        for i, inp in enumerate(inputs):
+            inp.request_id = i + 1
+        return inputs
+
+    def _make_capture_batch_response(self, codes, message=""):
+        response = BatchGenerateOutputsPB()
+        for i, code in enumerate(codes):
+            result = response.results.add()
+            if code is not None:
+                result.error_info.error_code = code
+                result.error_info.error_message = message
+            else:
+                result.final_output.CopyFrom(_make_response(output_len=0))
+                result.final_output.flatten_output.aux_info[0].input_len = i + 1
+        return response
+
+    def test_batch_capture_backpressure_preserves_order_and_item_traces(self):
+        busy = ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE
+        for codes, message in (
+            ((busy, None), ""),
+            ((None, busy), "full"),
+            ((busy, busy), "full"),
+        ):
+            with self.subTest(codes=codes, message=message):
+                inputs = self._make_capture_batch_inputs(len(codes))
+                before = [inp.generate_config.model_dump() for inp in inputs]
+                response = self._make_capture_batch_response(codes, message)
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response)
+                )
+                item_spans = [_FakeClientSpan() for _ in inputs]
+                rpc_span = _FakeClientSpan()
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.start_batch_item_span",
+                        side_effect=[(span, []) for span in item_spans],
+                    ),
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.start_client_span",
+                        return_value=(rpc_span, []),
+                    ),
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.trans_output",
+                        wraps=trans_output,
+                    ) as convert,
+                ):
+                    results = asyncio.run(
+                        client.batch_generate(
+                            inputs, preserve_capture_backpressure=True
+                        )
+                    )
+                self.assertEqual(len(results), len(inputs))
+                self.assertEqual(
+                    [call.args[0].request_id for call in convert.call_args_list],
+                    [i + 1 for i, code in enumerate(codes) if code is None],
+                )
+                for i, (result, code) in enumerate(zip(results, codes)):
+                    if code is not None:
+                        self.assertIsInstance(result, FtRuntimeException)
+                        self.assertEqual(
+                            result.exception_type,
+                            ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE,
+                        )
+                        self.assertIn(f"batch item {i} failed:", result.message)
+                        self.assertEqual(item_spans[i].error_type, "BusinessError")
+                    else:
+                        self.assertIsInstance(result, GenerateOutputs)
+                        self.assertTrue(result.generate_outputs[0].finished)
+                        self.assertEqual(
+                            result.generate_outputs[0].aux_info.input_len, i + 1
+                        )
+                    self.assertEqual(
+                        item_spans[i].status, "ERROR" if code is not None else "OK"
+                    )
+                    self.assertEqual(item_spans[i].end_count, 1)
+                self.assertEqual(rpc_span.status, "OK")
+                self.assertEqual(rpc_span.attributes["rpc.response.status_code"], "OK")
+                self.assertEqual(
+                    [inp.generate_config.model_dump() for inp in inputs], before
+                )
+
+    def test_batch_capture_backpressure_default_and_alias_still_raise(self):
+        for method, kwargs in (
+            ("batch_generate", {}),
+            ("batch_generate", {"preserve_capture_backpressure": False}),
+            ("batch_enqueue", {}),
+        ):
+            with self.subTest(method=method, kwargs=kwargs):
+                response = self._make_capture_batch_response(
+                    (ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE, None)
+                )
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response)
+                )
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.trans_output"
+                    ) as convert,
+                    self.assertRaises(FtRuntimeException) as caught,
+                ):
+                    asyncio.run(
+                        getattr(client, method)(
+                            self._make_capture_batch_inputs(2), **kwargs
+                        )
+                    )
+                self.assertEqual(
+                    caught.exception.exception_type,
+                    ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE,
+                )
+                convert.assert_not_called()
+
+    def test_batch_capture_backpressure_rejects_non_strict_inputs_before_rpc(self):
+        for overrides in (
+            {"max_new_tokens": 1},
+            {"capture_hidden_states": False},
+            {"reuse_cache": True},
+            {"return_prompt_logits": True},
+        ):
+            with self.subTest(overrides=overrides):
+                inputs = self._make_capture_batch_inputs(2)
+                inputs[1].generate_config = inputs[1].generate_config.model_copy(
+                    update=overrides
+                )
+                before = [inp.generate_config.model_dump() for inp in inputs]
+                client = self._make_batch_client()
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub"
+                    ) as stub,
+                    self.assertRaises(FtRuntimeException) as caught,
+                ):
+                    asyncio.run(
+                        client.batch_generate(
+                            inputs, preserve_capture_backpressure=True
+                        )
+                    )
+                self.assertEqual(
+                    caught.exception.exception_type, ExceptionType.INVALID_PARAMS
+                )
+                self.assertIn("invalid batch item 1", caught.exception.message)
+                client._channel_pool.get.assert_not_awaited()
+                stub.assert_not_called()
+                self.assertEqual(
+                    [inp.generate_config.model_dump() for inp in inputs], before
+                )
+
+    def test_batch_capture_backpressure_never_preserves_other_item_errors(self):
+        for code, expected in (
+            (ErrorCodePB.INVALID_PARAMS, ExceptionType.INVALID_PARAMS),
+            (ErrorCodePB.EXECUTION_EXCEPTION, ExceptionType.EXECUTION_EXCEPTION),
+            (ErrorCodePB.NONE_ERROR, ExceptionType.UNKNOWN_ERROR),
+            (8107, ExceptionType.UNKNOWN_ERROR),
+            (2_000_000_000, ExceptionType.UNKNOWN_ERROR),
+        ):
+            with self.subTest(code=code):
+                response = self._make_capture_batch_response(
+                    (ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE, code, None),
+                    "HIDDEN_STATE_CAPTURE_BACKPRESSURE busy 8107",
+                )
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response)
+                )
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.trans_output"
+                    ) as convert,
+                    self.assertRaises(FtRuntimeException) as caught,
+                ):
+                    asyncio.run(
+                        client.batch_generate(
+                            self._make_capture_batch_inputs(3),
+                            preserve_capture_backpressure=True,
+                        )
+                    )
+                self.assertEqual(caught.exception.exception_type, expected)
+                self.assertIn("batch item 1 failed:", caught.exception.message)
+                convert.assert_not_called()
+
+    def test_batch_capture_backpressure_transport_and_conversion_still_raise(self):
+        details = ErrorDetailsPB(
+            error_code=8107, error_message="capture admission full"
+        )
+        transport_error = _FakeRpcError(
+            StatusCode.RESOURCE_EXHAUSTED,
+            {"grpc-status-details-bin": details.SerializeToString()},
+        )
+        for rpc_error, conversion_error, expected in (
+            (transport_error, None, FtRuntimeException),
+            (None, ValueError("invalid output tensor"), ValueError),
+        ):
+            with self.subTest(expected=expected):
+                response = self._make_capture_batch_response(
+                    (ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE, None)
+                )
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response, side_effect=rpc_error)
+                )
+                with (
+                    patch(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client.trans_output",
+                        wraps=trans_output,
+                        side_effect=conversion_error,
+                    ) as convert,
+                    self.assertRaises(expected) as caught,
+                ):
+                    asyncio.run(
+                        client.batch_generate(
+                            self._make_capture_batch_inputs(2),
+                            preserve_capture_backpressure=True,
+                        )
+                    )
+                if rpc_error is not None:
+                    convert.assert_not_called()
+                    self.assertEqual(
+                        caught.exception.exception_type,
+                        ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE,
+                    )
+                else:
+                    convert.assert_called_once()
+                    self.assertIs(caught.exception, conversion_error)
+
+    def test_capture_backpressure_code_category_and_single_grpc_details(self):
+        code = ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE
+        self.assertEqual(code.value, 8107)
+        self.assertEqual(code.category, ExceptionCategory.CAPACITY)
+        self.assertEqual(
+            _trans_rpc_error_code(ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE), code
+        )
+        # A capacity transport status or matching text is not an item rejection.
+        for raw_code, expected in (
+            (8107, code),
+            (28, ExceptionType.UNKNOWN_ERROR),
+            (606, ExceptionType.EXECUTION_EXCEPTION),
+            (None, ExceptionType.UNKNOWN_ERROR),
+        ):
+            with self.subTest(raw_code=raw_code):
+                metadata = {}
+                if raw_code is not None:
+                    metadata["grpc-status-details-bin"] = ErrorDetailsPB(
+                        error_code=raw_code,
+                        error_message="HIDDEN_STATE_CAPTURE_BACKPRESSURE busy 8107",
+                    ).SerializeToString()
+                error = _FakeRpcError(StatusCode.RESOURCE_EXHAUSTED, metadata)
+                client = self._make_batch_client()
+                with self.assertRaises(FtRuntimeException) as caught:
+                    client._handle_grpc_error(error, "request: [1]")
+                self.assertEqual(caught.exception.exception_type, expected)
 
     def test_batch_enqueue_is_compatibility_alias_for_batch_generate(self):
         client = self._make_batch_client()
@@ -995,37 +1275,46 @@ class ModelRpcClientTest(TestCase):
         self.assertIsNone(results[0].generate_outputs[0].aux_info)
 
     def test_batch_prefill_only_rejects_missing_aux_info(self):
-        response = BatchGenerateOutputsPB()
-        response.results.add().final_output.CopyFrom(_make_response())
-        client = self._make_batch_client()
-        stub = MagicMock()
-        stub.BatchGenerateCall = AsyncMock(return_value=response)
-
-        with (
-            patch(
-                "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub",
-                return_value=stub,
-            ),
-            self.assertLogs(
-                "rtp_llm.cpp.model_rpc.model_rpc_client", level="ERROR"
-            ) as logs,
-            self.assertRaises(FtRuntimeException) as context,
-        ):
-            asyncio.run(
-                client.batch_enqueue(
-                    [
+        for preserve in (False, True):
+            with self.subTest(preserve=preserve):
+                inputs = (
+                    self._make_capture_batch_inputs(2)
+                    if preserve
+                    else [
                         self._make_generate_input(
                             GenerateConfig(max_new_tokens=0, aux_info=True)
                         )
                     ]
                 )
-            )
-
-        self.assertEqual(
-            context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
-        )
-        self.assertIn("completed without aux_info", context.exception.message)
-        self.assertIn("request_id=1", "\n".join(logs.output))
+                response = BatchGenerateOutputsPB()
+                if preserve:
+                    response.results.add().error_info.error_code = (
+                        ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE
+                    )
+                response.results.add().final_output.CopyFrom(_make_response())
+                client = self._make_batch_client(
+                    batch_call=AsyncMock(return_value=response)
+                )
+                with (
+                    self.assertLogs(
+                        "rtp_llm.cpp.model_rpc.model_rpc_client", level="ERROR"
+                    ) as logs,
+                    self.assertRaises(FtRuntimeException) as context,
+                ):
+                    asyncio.run(
+                        client.batch_generate(
+                            inputs, preserve_capture_backpressure=True
+                        )
+                        if preserve
+                        else client.batch_enqueue(inputs)
+                    )
+                self.assertEqual(
+                    context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
+                )
+                self.assertIn("completed without aux_info", context.exception.message)
+                self.assertIn(
+                    f"request_id={inputs[-1].request_id}", "\n".join(logs.output)
+                )
 
     def test_batch_enqueue_maps_unknown_numeric_error_code_without_message(self):
         unknown_error_code = 2_000_000_000

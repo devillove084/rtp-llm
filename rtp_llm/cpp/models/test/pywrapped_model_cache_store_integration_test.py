@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import torch
 from rtp_llm.config.cuda_graph import GenerationPrefillCudaGraphUnsupportedBackend
+from rtp_llm.config.exceptions import ExceptionType
 
 
 def _install_isolated_graph_capture_stubs() -> None:
@@ -2101,7 +2102,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         )
 
     def submitCapture(self, publisher, request_id=1, wait=True):
-        reservation = publisher.reserve(request_id, 1)
+        reservation = publisher.reserve(request_id, 1).reservation
         self.assertIsNotNone(reservation)
         self.assertTrue(
             publisher.submit(
@@ -2136,7 +2137,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     before = list(store.call_sequence)
                     self.submitCapture(publisher)
                     self.assertTrue(publisher.fatal)
-                    self.assertFalse(publisher.reserve(2, 1))
+                    self.assertFalse(publisher.reserve(2, 1).reservation)
                     self.assertEqual(store.put_attempts, 0)
                     self.assertEqual(store.keys, set())
                     self.assertEqual(publisher.inflight_samples, 1)
@@ -2190,7 +2191,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     self.assertTrue(classifier_calls, "classifier injection was not reached")
                     self.assertTrue(publisher.fatal)
                     self.assertIn("injected original store poll failure", publisher.diagnostic)
-                    self.assertIsNone(publisher.reserve(2, 1))
+                    self.assertIsNone(publisher.reserve(2, 1).reservation)
                     self.assertEqual(store.put_attempts, 0)
                     self.assertEqual(store.keys, set())
                     self.assertEqual(publisher.inflight_samples, 1)
@@ -2263,7 +2264,11 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             reservation.cancel()
             self.assertEqual(publisher.inflight_samples, 1)
             self.assertEqual(publisher.inflight_bytes, 48)
-            self.assertIsNone(publisher.reserve(2, 1))
+            blocked = publisher.reserve(2, 1)
+            self.assertFalse(blocked.ok)
+            self.assertEqual(blocked.code, ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE)
+            self.assertIsNone(blocked.reservation)
+            self.assertEqual(store.put_attempts, 1)
             store.keys.remove("rtp_TestActor_1_ready")
             self.assertTrue(publisher.poll())
             self.assertEqual(publisher.inflight_samples, 1)
@@ -2272,8 +2277,12 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             self.consumeCapture(publisher)
             self.assertEqual(store.reclaim_calls, [])
             self.assertEqual(store.removed_keys, [])
-            replacement = publisher.reserve(1, 1)
+            admitted = publisher.reserve(1, 1)
+            self.assertTrue(admitted.ok)
+            self.assertEqual(admitted.code, 0)
+            replacement = admitted.reservation
             self.assertIsNotNone(replacement)
+            self.assertEqual(store.put_attempts, 1)
             reservation.cancel()
             self.assertEqual(publisher.inflight_samples, 1)
             replacement.cancel()
@@ -2320,7 +2329,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             self.assertIn("rejected duplicate request keys", publisher.diagnostic)
             self.assertFalse(publisher.fatal)
             self.assertEqual(publisher.inflight_samples, 0)
-            next_reservation = publisher.reserve(2, 1)
+            next_reservation = publisher.reserve(2, 1).reservation
             self.assertIsNotNone(next_reservation)
             next_reservation.cancel()
         finally:
@@ -2358,7 +2367,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     self.assertEqual(_FakeEagleMooncakeStore.instances[-1].put_attempts, 0)
                     self.assertEqual(publisher.inflight_samples, 0)
                     self.assertIn("query_keys", publisher.diagnostic)
-                    self.assertIsNone(publisher.reserve(2, 1))
+                    self.assertIsNone(publisher.reserve(2, 1).reservation)
                 finally:
                     publisher.close()
 
@@ -2383,7 +2392,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     with patch.object(_FakeEagleMooncakeStore, "query_keys", query):
                         self.assertTrue(publisher.poll())
                         self.assertEqual(publisher.inflight_samples, 1)
-                        self.assertIsNone(publisher.reserve(2, 1))
+                        self.assertIsNone(publisher.reserve(2, 1).reservation)
                         self.assertFalse(publisher.fatal)
                     self.assertTrue(store.keys)
                     self.assertEqual(store.reclaim_calls, [])
@@ -2391,7 +2400,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     self.assertEqual(store.reclaim_calls, ["rtp_TestActor_1"])
                     self.assertEqual(store.keys, set())
                     self.assertEqual(publisher.inflight_samples, 0)
-                    reservation = publisher.reserve(2, 1)
+                    reservation = publisher.reserve(2, 1).reservation
                     self.assertIsNotNone(reservation)
                     reservation.cancel()
                 finally:
@@ -2409,7 +2418,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             return accepted
 
         try:
-            reservations = [publisher.reserve(i, 1) for i in (1, 2, 3)]
+            reservations = [publisher.reserve(i, 1).reservation for i in (1, 2, 3)]
             self.assertTrue(all(reservations))
             with patch.object(_FakeEagleMooncakeStore, "put_batch", partial_put):
                 self.assertTrue(
@@ -2430,7 +2439,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             for reservation in reservations:
                 reservation.cancel()
             self.assertEqual(publisher.inflight_samples, 2)
-            suffix = publisher.reserve(3, 1)
+            suffix = publisher.reserve(3, 1).reservation
             self.assertIsNotNone(suffix)
             suffix.cancel()
             store.abandon_capture("rtp_TestActor_2")
@@ -2578,7 +2587,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     with patch.object(_FakeEagleMooncakeStore, "reclaim_abandoned_capture", reclaim):
                         self.assertTrue(publisher.poll())
                         self.assertTrue(publisher.fatal)
-                        self.assertIsNone(publisher.reserve(3, 1))
+                        self.assertIsNone(publisher.reserve(3, 1).reservation)
                         self.assertEqual(publisher.inflight_samples, 2)
                         calls_at_failure = list(store.call_sequence)
                         self.assertEqual(calls_at_failure[-2:], ["query_keys", f"reclaim_abandoned_capture:{bases[0]}"])
@@ -2604,7 +2613,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         publisher.close()
         self.assertFalse(store.closed)
         self.assertEqual(store.keys, keys)
-        self.assertIsNone(publisher.reserve(2, 1))
+        self.assertIsNone(publisher.reserve(2, 1).reservation)
 
     def test_capture_initialization_runs_on_worker_without_blocking_constructor(
         self,
@@ -2624,7 +2633,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(10))
                 self.assertFalse(publisher.drain(timeout_ms=0))
-                reservation = publisher.reserve(1, 1)
+                reservation = publisher.reserve(1, 1).reservation
                 self.assertIsNotNone(reservation)
                 reservation.cancel()
             finally:
@@ -2706,7 +2715,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     _FakeEagleMooncakeStore, "flush", pending_flush
                 ), patch.object(_FakeEagleMooncakeStore, "take_async_errors", completion_errors):
                     try:
-                        reservation = publisher.reserve(1, 1)
+                        reservation = publisher.reserve(1, 1).reservation
                         self.assertIsNotNone(reservation)
                         packed = torch.tensor([[10, 20, 30]], dtype=torch.float16)
                         storage_refs.append(packed.untyped_storage()._weak_ref())
@@ -2807,7 +2816,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             publisher = _extension.CapturePublisher()
             try:
                 self.assertTrue(entered.wait(10))
-                reservation = publisher.reserve(1, 1)
+                reservation = publisher.reserve(1, 1).reservation
                 self.assertIsNotNone(reservation)
                 self.assertTrue(
                     publisher.submit(
@@ -2823,7 +2832,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 self.assertTrue(publisher.drain())
                 self.assertEqual(publisher.inflight_samples, 0)
                 self.assertIn("queued initialization failure", publisher.diagnostic)
-                self.assertIsNone(publisher.reserve(2, 1))
+                self.assertIsNone(publisher.reserve(2, 1).reservation)
                 self.assertEqual(_FakeEagleMooncakeStore.instances[-1].put_attempts, 0)
                 self.assertTrue(_FakeEagleMooncakeStore.instances[-1].closed)
             finally:
@@ -2844,12 +2853,12 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 below = self.capturePublisher(bytes=expected_bytes - 1, model_dtype=dtype, fp8=fp8)
                 exact = self.capturePublisher(bytes=expected_bytes, model_dtype=dtype, fp8=fp8)
                 try:
-                    self.assertFalse(below.reserve(1, 2))
+                    self.assertFalse(below.reserve(1, 2).reservation)
                     self.assertEqual(below.inflight_bytes, 0)
-                    reservation = exact.reserve(1, 2)
+                    reservation = exact.reserve(1, 2).reservation
                     self.assertIsNotNone(reservation)
                     self.assertEqual(exact.inflight_bytes, expected_bytes)
-                    self.assertFalse(exact.reserve(2, 1))
+                    self.assertFalse(exact.reserve(2, 1).reservation)
                     reservation.cancel()
                     self.assertEqual(exact.inflight_bytes, 0)
                 finally:
@@ -2872,7 +2881,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         packed = torch.tensor([[10, 20, 30], [11, 21, 31]], dtype=torch.float16, device="cuda")
         with patch.object(_FakeEagleMooncakeStore, "put_batch", blocked_put):
             try:
-                reservation = publisher.reserve(1, 2)
+                reservation = publisher.reserve(1, 2).reservation
                 self.assertIsNotNone(reservation)
                 self.assertTrue(
                     publisher.submit(
@@ -2888,7 +2897,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 self.assertTrue(entered.wait(10))
                 self.assertFalse(publisher.drain(timeout_ms=0))
                 self.assertEqual(publisher.inflight_bytes, 76)
-                self.assertFalse(publisher.reserve(2, 1))
+                self.assertFalse(publisher.reserve(2, 1).reservation)
             finally:
                 release.set()
             self.assertTrue(publisher.drain())
@@ -2902,7 +2911,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
     def test_capture_quota_rejects_oversized_retained_source_storage(self) -> None:
         publisher = self.capturePublisher(bytes=76)
         self.addCleanup(publisher.close)
-        oversized = publisher.reserve(1, 2)
+        oversized = publisher.reserve(1, 2).reservation
         self.assertIsNotNone(oversized)
         parent = torch.arange(300, dtype=torch.float16).reshape(100, 3)
         view = parent[:2]
@@ -2912,7 +2921,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(publisher.inflight_bytes, 76)
         oversized.cancel()
         self.assertEqual(publisher.inflight_bytes, 0)
-        owned = publisher.reserve(2, 2)
+        owned = publisher.reserve(2, 2).reservation
         self.assertIsNotNone(owned)
         self.assertTrue(publisher.submit(view.clone(), ids, lengths, torch.tensor([2]), 2, "owned source"))
         self.assertTrue(publisher.drain())
@@ -2928,7 +2937,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
     ) -> None:
         publisher = self.capturePublisher(bytes=124, samples=2, tokens=3, layer_ids=[1, 0])
         self.addCleanup(publisher.close)
-        reservations = [publisher.reserve(41, 2), publisher.reserve(42, 1)]
+        reservations = [publisher.reserve(41, 2).reservation, publisher.reserve(42, 1).reservation]
         self.assertTrue(all(reservations))
         packed = torch.tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32]], dtype=torch.float16).transpose(0, 1)
         self.assertFalse(packed.is_contiguous())
@@ -3046,6 +3055,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertCaptureStatus(result["capture_metrics"], enabled=1, broken=0)
 
     def test_capture_reservation_limits_and_cancellation(self) -> None:
+        self.assertEqual(ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE, 8107)
         # Only one resource is tight per row; no earlier limit masks tokens.
         for resource, limits in (
             ("samples", dict(samples=1, bytes=1_000_000, tokens=100)),
@@ -3067,22 +3077,35 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     )
                     self.assertEqual(publisher.inflight_bytes, 0)
                     self.assertEqual(_FakeEagleMooncakeStore.instances[-1].puts, [])
-                    self.assertIsNone(publisher.reserve(-1, 2))
-                    self.assertIsNone(publisher.reserve(1, 0))
-                    self.assertIsNone(publisher.reserve(1, 2**63 - 1))
-                    first = publisher.reserve(1, 2)
+                    admitted = publisher.reserve(1, 2)
+                    self.assertTrue(admitted.ok)
+                    self.assertEqual(admitted.code, 0)
+                    first = admitted.reservation
                     self.assertIsNotNone(first)
                     self.assertTrue(first.active)
-                    self.assertIsNone(publisher.reserve(1, 2))
-                    self.assertIsNone(publisher.reserve(2, 1))
+                    for request_id, tokens in ((-1, 2), (1, 0), (1, 2**63 - 1), (1, 2)):
+                        invalid = publisher.reserve(request_id, tokens)
+                        self.assertFalse(invalid.ok)
+                        self.assertEqual(invalid.code, ExceptionType.INVALID_PARAMS)
+                        self.assertIsNone(invalid.reservation)
+                    blocked = publisher.reserve(2, 1)
+                    self.assertFalse(blocked.ok)
+                    self.assertEqual(blocked.code, ExceptionType.HIDDEN_STATE_CAPTURE_BACKPRESSURE)
+                    self.assertIsNone(blocked.reservation)
+                    if resource != "samples":
+                        # Permanent oversize stays invalid with occupied or idle quota.
+                        self.assertEqual(publisher.reserve(3, 3).code, ExceptionType.INVALID_PARAMS)
                     self.assertEqual(publisher.inflight_samples, 1)
                     self.assertEqual(publisher.inflight_bytes, 76)
+                    self.assertEqual(_FakeEagleMooncakeStore.instances[-1].put_attempts, 0)
                     first.cancel()
                     first.cancel()
                     self.assertFalse(first.active)
                     self.assertEqual(publisher.inflight_samples, 0)
                     self.assertEqual(publisher.inflight_bytes, 0)
-                    second = publisher.reserve(2, 2)
+                    if resource != "samples":
+                        self.assertEqual(publisher.reserve(3, 3).code, ExceptionType.INVALID_PARAMS)
+                    second = publisher.reserve(2, 2).reservation
                     self.assertIsNotNone(second)
                     self.assertTrue(
                         publisher.submit(
@@ -3098,7 +3121,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     self.assertEqual(publisher.inflight_samples, 1)
                     self.assertEqual(publisher.inflight_bytes, 76)
                     self.consumeCapture(publisher)
-                    third = publisher.reserve(3, 2)
+                    third = publisher.reserve(3, 2).reservation
                     self.assertIsNotNone(third)
                     third.cancel()
                     self.assertEqual(publisher.inflight_samples, 0)
@@ -3110,6 +3133,19 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                     self.assertEqual(publisher.diagnostic, "")
                 finally:
                     publisher.close()
+                stopped = publisher.reserve(4, 1)
+                self.assertFalse(stopped.ok)
+                self.assertEqual(stopped.code, ExceptionType.CANCELLED)
+                self.assertIsNone(stopped.reservation)
+
+        disabled = self.capturePublisher(samples=0)
+        try:
+            unavailable = disabled.reserve(1, 1)
+            self.assertFalse(unavailable.ok)
+            self.assertEqual(unavailable.code, ExceptionType.EXECUTION_EXCEPTION)
+            self.assertIsNone(unavailable.reservation)
+        finally:
+            disabled.close()
 
     def assertForwardParity(self, result, baseline, count):
         for name in (
@@ -3242,7 +3278,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
     def test_capture_reservation_generation_and_publisher_lifetime(self) -> None:
         publisher = self.capturePublisher(samples=1, bytes=48, tokens=1)
         try:
-            first = publisher.reserve(7, 1)
+            first = publisher.reserve(7, 1).reservation
             self.assertIsNotNone(first)
             self.assertTrue(
                 publisher.submit(
@@ -3265,7 +3301,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             self.consumeCapture(publisher)
 
             # Reuse the ID only after the consumer removes all source keys.
-            second = publisher.reserve(7, 1)
+            second = publisher.reserve(7, 1).reservation
             self.assertIsNotNone(second)
             first.cancel()
             first.cancel()
@@ -3273,16 +3309,16 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             self.assertTrue(second.active)
             self.assertEqual(publisher.inflight_samples, 1)
             self.assertEqual(publisher.inflight_bytes, 48)
-            self.assertIsNone(publisher.reserve(8, 1))
+            self.assertIsNone(publisher.reserve(8, 1).reservation)
             second.cancel()
             self.assertEqual(publisher.inflight_samples, 0)
             self.assertEqual(publisher.inflight_bytes, 0)
 
-            automatic = publisher.reserve(8, 1)
+            automatic = publisher.reserve(8, 1).reservation
             self.assertIsNotNone(automatic)
             del automatic
             self.assertEqual(publisher.inflight_samples, 0)
-            orphan = publisher.reserve(8, 1)
+            orphan = publisher.reserve(8, 1).reservation
             self.assertIsNotNone(orphan)
             self.assertFalse(store.closed)
             # Tokens must not own the publisher, model, or an Executor.
@@ -3315,7 +3351,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         reservations = {}
 
         def submit(request_id):
-            reservations[request_id] = publisher.reserve(request_id, 1)
+            reservations[request_id] = publisher.reserve(request_id, 1).reservation
             self.assertIsNotNone(reservations[request_id])
             return publisher.submit(
                 packed,
@@ -3350,7 +3386,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
     def test_capture_nondefault_producer_stream_and_async_pinned_lengths(self) -> None:
         publisher = self.capturePublisher()
         self.addCleanup(publisher.close)
-        reservation = publisher.reserve(42, 2)
+        reservation = publisher.reserve(42, 2).reservation
         self.assertIsNotNone(reservation)
         producer = torch.cuda.Stream()
         with torch.cuda.stream(producer):
@@ -3745,7 +3781,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 failures.append(error)
 
         with patch.object(_FakeEagleMooncakeStore, "put_batch", blocked_put):
-            reservation = publisher.reserve(1, 1)
+            reservation = publisher.reserve(1, 1).reservation
             self.assertIsNotNone(reservation)
             self.assertTrue(
                 publisher.submit(
@@ -3758,7 +3794,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 )
             )
             self.assertTrue(entered.wait(10))
-            unsubmitted = publisher.reserve(2, 1)
+            unsubmitted = publisher.reserve(2, 1).reservation
             self.assertIsNotNone(unsubmitted)
             self.assertEqual(publisher.inflight_samples, 2)
             first = threading.Thread(target=close)
@@ -3789,7 +3825,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertFalse(_FakeEagleMooncakeStore.instances[-1].closed)
         self.assertEqual(publisher.inflight_samples, 0)
-        self.assertFalse(publisher.reserve(2, 1))
+        self.assertFalse(publisher.reserve(2, 1).reservation)
 
     def test_capture_failed_flush_retains_bounded_quota(self) -> None:
         publisher = self.capturePublisher(samples=1, bytes=48, tokens=1)
@@ -3798,7 +3834,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             _FakeEagleMooncakeStore, "events", store_calls
         ):
             try:
-                reservation = publisher.reserve(1, 1)
+                reservation = publisher.reserve(1, 1).reservation
                 self.assertIsNotNone(reservation)
                 self.assertTrue(
                     publisher.submit(
@@ -3813,7 +3849,7 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                 self.assertTrue(publisher.drain())
                 self.assertEqual(publisher.inflight_samples, 1)
                 self.assertEqual(publisher.inflight_bytes, 48)
-                self.assertFalse(publisher.reserve(2, 1))
+                self.assertFalse(publisher.reserve(2, 1).reservation)
                 self.assertIn("flush failure", publisher.diagnostic)
                 self.assertFalse(publisher.fatal)
                 store = _FakeEagleMooncakeStore.instances[-1]
@@ -5154,7 +5190,7 @@ class CaptureNativeStructureTest(unittest.TestCase):
             admission,
             rf"std::lock_guard<std::mutex>\s+\w+\({re.escape(mutex)}\);\s*"
             r"if\s*\(executor_\)\s*\{\s*"
-            r"reservation\s*=\s*executor_->tryReserveHiddenStateCapture\(",
+            r"auto\s+admission\s*=\s*executor_->tryReserveHiddenStateCapture\(",
         )
         self.assertRegex(admission, r"catch\s*\(const std::bad_alloc&\)\s*\{\s*throw;")
         self.assertLess(stop.index("loop_thread_->join();"), shutdown.start())

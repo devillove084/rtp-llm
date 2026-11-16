@@ -48,6 +48,7 @@ public:
 
 class TestLocalRpcServer: public LocalRpcServer {
 public:
+    using LocalRpcServer::serializeErrorMsg;
     grpc::Status poll(std::shared_ptr<GenerateStream>& stream) {
         return pollStreamOutput(nullptr, "request", nullptr, stream);
     }
@@ -1011,6 +1012,28 @@ TEST(RpcErrorCodeTest, InvalidParamsUsesDeclaredRpcEnum) {
     EXPECT_EQ(transErrorCodeToRPC(ErrorCode::INVALID_PARAMS), ErrorCodePB::INVALID_PARAMS);
     EXPECT_EQ(transRPCErrorCode(ErrorCodePB::INVALID_PARAMS), ErrorCode::INVALID_PARAMS);
     EXPECT_NE(static_cast<int>(ErrorCodePB::INVALID_PARAMS), static_cast<int>(ErrorCode::INVALID_PARAMS));
+}
+
+TEST(RpcErrorCodeTest, CaptureBackpressureRoundTripsDeclaredRpcEnum) {
+    const auto code = ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE;
+    EXPECT_EQ(static_cast<int>(code), 8107);
+    EXPECT_EQ(static_cast<int>(ErrorCodePB::HIDDEN_STATE_CAPTURE_BACKPRESSURE), 28);
+    EXPECT_EQ(ErrorCodeToString(code), "HIDDEN_STATE_CAPTURE_BACKPRESSURE");
+    EXPECT_EQ(transErrorCodeToRPC(code), ErrorCodePB::HIDDEN_STATE_CAPTURE_BACKPRESSURE);
+    EXPECT_EQ(transRPCErrorCode(transErrorCodeToRPC(code)), code);
+    EXPECT_EQ(transErrorCodeToGrpc(code), grpc::StatusCode::RESOURCE_EXHAUSTED);
+}
+
+TEST(LocalRpcServerTest, CaptureBackpressureSingleGrpcDetailsPreserveNativeCode) {
+    TestLocalRpcServer server;
+    const auto status = server.serializeErrorMsg(
+        "capture", ErrorInfo(ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "capture admission full"));
+
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::RESOURCE_EXHAUSTED);
+    ErrorDetailsPB details;
+    ASSERT_TRUE(details.ParseFromString(status.error_details()));
+    EXPECT_EQ(details.error_code(), 8107);
+    EXPECT_EQ(details.error_message(), "capture admission full");
 }
 
 TEST(LocalRpcServerTest, UninitializedServerRejectsValidBatchRequests) {

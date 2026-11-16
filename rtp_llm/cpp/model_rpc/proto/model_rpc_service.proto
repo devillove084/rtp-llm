@@ -167,7 +167,9 @@ message GenerateConfigPB {
     // Explicit target-prefill assertion. true requires max_new_tokens == 0 and cannot be combined with
     // return_prompt_logits. false/omitted does not change the legacy bare-zero behavior above.
     bool prefill_only = 76;
-    // Best-effort prompt capture requires reuse_cache=false. Bare zero-token prefill stays eligible.
+    // Prompt capture requires reuse_cache=false. Effective max_new_tokens == 0 with capture=true
+    // uses strict admission; transient rejection precedes any reservation/publication.
+    // Bare zero-token prefill and positive-token capture remain best-effort (fail-open).
     bool capture_hidden_states = 77;
 }
 
@@ -426,6 +428,8 @@ enum ErrorCodePB {
     P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE = 25;
     INVALID_PARAMS = 26;
     EXECUTION_EXCEPTION = 27;
+    // Transient strict capture admission rejection; no reservation/publication is possible.
+    HIDDEN_STATE_CAPTURE_BACKPRESSURE = 28;
 }
 
 // transfer between prefill and decode

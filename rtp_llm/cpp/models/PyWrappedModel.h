@@ -97,7 +97,7 @@ public:
     void                       prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync);
     void                       updateKVCacheKernelBlockId(const GptModelInputs& inputs) override;
     std::string                waitCacheStorePublication() override;
-    HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override;
+    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override;
     bool                       hasSpeculativeTargetCommitHooks() const override;
     std::string                prepareSpeculativeTargetCommit(const torch::Tensor& accept_len) override;
     std::string                finishSpeculativeTargetCommit(bool commit) override;

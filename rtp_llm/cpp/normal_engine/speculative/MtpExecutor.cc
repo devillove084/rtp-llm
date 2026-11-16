@@ -44,8 +44,11 @@
 
 namespace rtp_llm {
 
-HiddenStateCaptureReservationPtr MtpExecutor::tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) {
-    return model_ ? model_->tryReserveHiddenStateCapture(request_id, valid_tokens) : nullptr;
+HiddenStateCaptureAdmissionResult MtpExecutor::tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) {
+    if (!model_) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture target model is unavailable"};
+    }
+    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens);
 }
 
 bool MtpExecutor::dsparkPrefillCPRoleIsValid(const PrefillCPConfig& prefill_cp_config, RoleType role_type) {

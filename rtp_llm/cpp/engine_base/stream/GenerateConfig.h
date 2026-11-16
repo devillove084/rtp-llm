@@ -87,7 +87,8 @@ public:
     bool                          return_incremental       = false;
     bool                          return_hidden_states     = false;
     bool                          return_all_hidden_states = false;
-    // Explicit prompt capture requires reuse_cache=false; bare zero-token prefill stays eligible.
+    // Zero-token opt-in requires capture admission; positive generation and bare zero remain best-effort.
+    // Explicit prompt capture requires reuse_cache=false.
     bool                          capture_hidden_states    = false;
     bool                          normalized_hidden_states = false;
     bool                          return_output_ids        = false;
@@ -145,6 +146,10 @@ public:
 
     bool isPrefillOnly() const {
         return max_new_tokens == 0;
+    }
+
+    bool requiresHiddenStateCaptureAdmission() const {
+        return isPrefillOnly() && capture_hidden_states;
     }
 
     void enforcePromptScoringConstraints() {

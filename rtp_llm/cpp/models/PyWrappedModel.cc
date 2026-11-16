@@ -303,10 +303,12 @@ bool PyWrappedModel::shouldCaptureHiddenStates(const GptModelInputs& inputs) {
     return true;
 }
 
-HiddenStateCaptureReservationPtr PyWrappedModel::tryReserveHiddenStateCapture(int64_t request_id,
-                                                                              int64_t valid_tokens) {
-    return hidden_state_capture_publisher_ ? hidden_state_capture_publisher_->tryReserve(request_id, valid_tokens) :
-                                             nullptr;
+HiddenStateCaptureAdmissionResult PyWrappedModel::tryReserveHiddenStateCapture(int64_t request_id,
+                                                                               int64_t valid_tokens) {
+    if (!hidden_state_capture_publisher_) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture publisher is unavailable"};
+    }
+    return hidden_state_capture_publisher_->tryReserve(request_id, valid_tokens);
 }
 
 void PyWrappedModel::discardHiddenStateCapture(const GptModelInputs& inputs, const std::string& reason) {

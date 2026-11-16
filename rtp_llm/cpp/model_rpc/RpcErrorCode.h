@@ -19,6 +19,7 @@ inline grpc::StatusCode transErrorCodeToGrpc(ErrorCode error_code) {
         // ErrorDetailsPB trailing metadata.
         {ErrorCode::PRIORITY_PREEMPTED, grpc::StatusCode::RESOURCE_EXHAUSTED},
         {ErrorCode::GRAMMAR_COMPILE_OVERLOADED, grpc::StatusCode::RESOURCE_EXHAUSTED},
+        {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, grpc::StatusCode::RESOURCE_EXHAUSTED},
         {ErrorCode::GENERATE_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
         {ErrorCode::CONNECT_TIMEOUT, grpc::StatusCode::DEADLINE_EXCEEDED},
         {ErrorCode::DEADLINE_EXCEEDED, grpc::StatusCode::DEADLINE_EXCEEDED},
@@ -79,6 +80,7 @@ inline ErrorCode transRPCErrorCode(ErrorCodePB error_code) {
          ErrorCode::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE},
         {ErrorCodePB::INVALID_PARAMS, ErrorCode::INVALID_PARAMS},
         {ErrorCodePB::EXECUTION_EXCEPTION, ErrorCode::EXECUTION_EXCEPTION},
+        {ErrorCodePB::HIDDEN_STATE_CAPTURE_BACKPRESSURE, ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE},
     };
     auto it = error_code_map.find(error_code);
     if (it != error_code_map.end()) {
@@ -126,6 +128,7 @@ inline ErrorCodePB transErrorCodeToRPC(ErrorCode error_code) {
          ErrorCodePB::P2P_CONNECTOR_WORKER_READ_TRANSFER_NOT_DONE},
         {ErrorCode::INVALID_PARAMS, ErrorCodePB::INVALID_PARAMS},
         {ErrorCode::EXECUTION_EXCEPTION, ErrorCodePB::EXECUTION_EXCEPTION},
+        {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, ErrorCodePB::HIDDEN_STATE_CAPTURE_BACKPRESSURE},
     };
     auto it = error_code_map.find(error_code);
     if (it != error_code_map.end()) {

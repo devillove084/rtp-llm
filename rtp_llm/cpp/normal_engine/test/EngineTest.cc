@@ -635,10 +635,10 @@ TEST_F(NormalEngineTest, testCreateStreamCaptureAdmissionPreservesAllocationFail
             return absl::InternalError("unexpected model execution");
         }
 
-        HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens) override {
             reserve_calls.emplace_back(request_id, tokens);
             if (quota_miss) {
-                return {};
+                return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "test capture quota occupied"};
             }
             return std::allocate_shared<HiddenStateCaptureReservation>(
                 AdmissionAllocator<HiddenStateCaptureReservation>(allocation), []() noexcept {});
@@ -672,8 +672,10 @@ TEST_F(NormalEngineTest, testCreateStreamCaptureAdmissionPreservesAllocationFail
     auto* allocator                                     = executor.get();
     engine->executor_                                   = std::move(executor);
     int64_t request_id                                  = 3000;
-    for (const int max_new_tokens : {1, 0}) {
-        SCOPED_TRACE(testing::Message() << "max_new_tokens=" << max_new_tokens);
+    for (const auto& mode : {std::pair<int, bool>{1, true}, {0, false}, {0, true}}) {
+        const auto max_new_tokens = mode.first;
+        const bool strict = max_new_tokens == 0 && mode.second;
+        SCOPED_TRACE(testing::Message() << "max_new_tokens=" << max_new_tokens << " capture=" << mode.second);
         for (const auto& test_case : cases) {
             SCOPED_TRACE(test_case.name);
             ASSERT_EQ(engine->getScheduler().onflightStreams(), 0);
@@ -685,8 +687,8 @@ TEST_F(NormalEngineTest, testCreateStreamCaptureAdmissionPreservesAllocationFail
             query->input_ids                              = torch::tensor({1, 2}, torch::kInt32);
             query->generate_config                        = std::make_shared<GenerateConfig>();
             query->generate_config->max_new_tokens        = max_new_tokens;
-            query->generate_config->capture_hidden_states = max_new_tokens > 0;
-            query->generate_config->reuse_cache           = max_new_tokens == 0;
+            query->generate_config->capture_hidden_states = mode.second;
+            query->generate_config->reuse_cache           = !mode.second;
 
             GenerateStreamPtr stream;
             if (test_case.expect_bad_alloc) {
@@ -696,14 +698,19 @@ TEST_F(NormalEngineTest, testCreateStreamCaptureAdmissionPreservesAllocationFail
             } else {
                 ASSERT_NO_THROW(stream = engine->createStream(query));
                 ASSERT_NE(stream, nullptr);
-                ASSERT_FALSE(stream->hasError());
-                EXPECT_TRUE(stream->isHiddenStateCaptureCandidate());
+                const bool rejected = strict && (test_case.error || test_case.quota_miss);
+                EXPECT_EQ(stream->hasError(), rejected);
+                if (rejected) {
+                    EXPECT_EQ(stream->statusInfo().code(), test_case.quota_miss ?
+                                  ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE : ErrorCode::EXECUTION_EXCEPTION);
+                }
+                EXPECT_EQ(stream->isHiddenStateCaptureCandidate(), !rejected);
                 EXPECT_EQ(stream->generateConfig()->max_new_tokens, max_new_tokens);
                 EXPECT_EQ(stream->generateConfig()->isPrefillOnly(), max_new_tokens == 0);
                 EXPECT_EQ(stream->hasHiddenStateCaptureReservation(), !test_case.error && !test_case.quota_miss);
                 engine->enqueue(stream);
-                EXPECT_FALSE(stream->hasError());
-                EXPECT_EQ(engine->getScheduler().onflightStreams(), 1);
+                EXPECT_EQ(stream->hasError(), rejected);
+                EXPECT_EQ(engine->getScheduler().onflightStreams(), rejected ? 0 : 1);
                 stream->cancelHiddenStateCapture();
             }
             EXPECT_EQ(allocator->reserve_calls,
@@ -722,11 +729,15 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
             return absl::InternalError("unexpected model execution");
         }
 
-        HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens) override {
             reserve_calls.emplace_back(request_id, tokens);
+            if (!next_reservation && admission_code != ErrorCode::NONE_ERROR) {
+                return {admission_code, "typed admission rejection"};
+            }
             return std::exchange(next_reservation, {});
         }
 
+        ErrorCode                               admission_code = ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE;
         HiddenStateCaptureReservationPtr         next_reservation;
         std::vector<std::pair<int64_t, int64_t>> reserve_calls;
     };
@@ -744,6 +755,8 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
         bool        offer_reservation;
         bool        expect_reserve_call;
         Rejection   rejection = Rejection::NONE;
+        ErrorCode   admission_code = ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE;
+        ErrorCode   expected_creation_error = ErrorCode::NONE_ERROR;
     };
     const TestCase cases[] = {
         {"global-off", false, 1, true, false, true, false},
@@ -751,8 +764,27 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
         {"generation-opt-in", true, 1, true, false, true, true},
         {"generation-reuse-conflict", true, 1, true, true, true, false},
         {"zero-token-legacy", true, 0, false, true, true, true},
-        {"zero-token-explicit-reuse-conflict", true, 0, true, true, true, false},
-        {"admission-miss", true, 1, true, false, false, true},
+        {"strict-accepted", true, 0, true, false, true, true},
+        {"strict-reuse-conflict", true, 0, true, true, false, false,
+         Rejection::NONE, ErrorCode::NONE_ERROR, ErrorCode::INVALID_PARAMS},
+        {"strict-unconfigured", false, 0, true, false, false, false,
+         Rejection::NONE, ErrorCode::NONE_ERROR, ErrorCode::EXECUTION_EXCEPTION},
+        {"strict-backpressure", true, 0, true, false, false, true,
+         Rejection::NONE, ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE},
+        {"strict-too-large", true, 0, true, false, false, true,
+         Rejection::NONE, ErrorCode::INVALID_PARAMS, ErrorCode::INVALID_PARAMS},
+        {"strict-unavailable", true, 0, true, false, false, true,
+         Rejection::NONE, ErrorCode::EXECUTION_EXCEPTION, ErrorCode::EXECUTION_EXCEPTION},
+        {"strict-stopping", true, 0, true, false, false, true,
+         Rejection::NONE, ErrorCode::CANCELLED, ErrorCode::CANCELLED},
+        {"strict-invalid-success-token", true, 0, true, false, false, true,
+         Rejection::NONE, ErrorCode::NONE_ERROR, ErrorCode::EXECUTION_EXCEPTION},
+        {"generation-quota-fail-open", true, 1, true, false, false, true},
+        {"bare-zero-quota-fail-open", true, 0, false, true, false, true},
+        {"generation-unavailable-fail-open", true, 1, true, false, false, true,
+         Rejection::NONE, ErrorCode::EXECUTION_EXCEPTION},
+        {"bare-zero-unavailable-fail-open", true, 0, false, true, false, true,
+         Rejection::NONE, ErrorCode::EXECUTION_EXCEPTION},
         {"enqueue-invalid-stream", true, 1, true, false, true, true, Rejection::EXISTING_ERROR},
         {"enqueue-scheduler-length-rejection", true, 1, true, false, true, true, Rejection::SCHEDULER_LENGTH},
     };
@@ -775,6 +807,7 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
                 [cancellation_count]() noexcept { ++*cancellation_count; });
         }
         recorder->next_reservation = offered;
+        recorder->admission_code = test_case.admission_code;
         recorder->reserve_calls.clear();
         auto query             = std::make_shared<GenerateInput>();
         query->request_id      = request_id++;
@@ -787,11 +820,22 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
 
         auto stream = engine->makeStream(query);
         ASSERT_NE(stream, nullptr);
-        ASSERT_FALSE(stream->hasError());
         const auto expected_calls = test_case.expect_reserve_call ?
                                         (std::vector<std::pair<int64_t, int64_t>>{{query->request_id, 2}}) :
                                         (std::vector<std::pair<int64_t, int64_t>>{});
         EXPECT_EQ(recorder->reserve_calls, expected_calls);
+        if (test_case.expected_creation_error != ErrorCode::NONE_ERROR) {
+            ASSERT_TRUE(stream->hasError());
+            EXPECT_EQ(stream->statusInfo().code(), test_case.expected_creation_error);
+            engine->enqueue(stream);
+            EXPECT_EQ(stream->statusInfo().code(), test_case.expected_creation_error);
+            EXPECT_EQ(engine->getScheduler().onflightStreams(), 0);
+            EXPECT_FALSE(stream->hasHiddenStateCaptureReservation());
+            EXPECT_EQ(recorder->reserve_calls, expected_calls);
+            recorder->next_reservation.reset();
+            continue;
+        }
+        ASSERT_FALSE(stream->hasError());
         const bool expected_reservation = test_case.expect_reserve_call && test_case.offer_reservation;
         EXPECT_EQ(stream->hasHiddenStateCaptureReservation(), expected_reservation);
         EXPECT_EQ(cancellation_count->load(), 0);
@@ -878,7 +922,7 @@ TEST_F(NormalEngineTest, testStopJoinsAsyncWorkerWithoutMovingExecutorDestructio
             state_->destructor_entered.set_value(std::this_thread::get_id());
         }
 
-        HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t, int64_t) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t, int64_t) override {
             auto state = state_;
             if (++state->reserve_calls == 1) {
                 return std::exchange(reservation_, {});

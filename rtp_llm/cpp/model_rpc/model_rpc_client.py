@@ -1624,13 +1624,21 @@ class ModelRpcClient(object):
                 response_iterator.cancel()
 
     async def batch_generate(
-        self, inputs: list[GenerateInput]
-    ) -> list[GenerateOutputs]:
-        """Run BatchGenerateCall with atomic batch failure semantics.
+        self,
+        inputs: list[GenerateInput],
+        *,
+        preserve_capture_backpressure: bool = False,
+    ) -> list[GenerateOutputs | FtRuntimeException]:
+        """Run BatchGenerateCall with atomic failure semantics by default.
 
-        The service must return one result per input. Any item-level error, result
-        cardinality mismatch, transport error, or conversion failure fails the
-        entire batch; partial successes are never returned to the caller.
+        Opt-in preservation requires every input to be strict zero-token capture
+        with reuse_cache=False. Only HIDDEN_STATE_CAPTURE_BACKPRESSURE is returned
+        as an FtRuntimeException at its input position, alongside later successes.
+        It certifies rejection before any capture reservation/publication.
+
+        All other item errors, cardinality mismatches, transport errors, and
+        conversion failures still raise for the whole call, returning no partial
+        results. Such failures do not establish retry safety for sibling inputs.
         """
         if not inputs:
             return []
@@ -1680,6 +1688,21 @@ class ModelRpcClient(object):
                 span, item_metadata = start_batch_item_span(inp.request_id, i)
                 item_spans.append(span)
                 input_pb = trans_input(inp)
+                if preserve_capture_backpressure:
+                    config_pb = input_pb.generate_config
+                    if not (
+                        config_pb.max_new_tokens == 0
+                        and config_pb.prefill_only
+                        and config_pb.capture_hidden_states
+                        and not config_pb.reuse_cache
+                    ):
+                        raise FtRuntimeException(
+                            ExceptionType.INVALID_PARAMS,
+                            "preserve_capture_backpressure requires every input to "
+                            "use effective max_new_tokens == 0, "
+                            "capture_hidden_states=True, and reuse_cache=False "
+                            f"(invalid batch item {i})",
+                        )
                 carrier = dict(item_metadata)
                 if carrier.get("traceparent"):
                     input_pb.request_info.trace_context.traceparent = carrier[
@@ -1751,10 +1774,17 @@ class ModelRpcClient(object):
                             result_pb.error_info.error_message
                             or _rpc_error_code_name(result_pb.error_info.error_code)
                         )
-                        raise FtRuntimeException(
+                        error = FtRuntimeException(
                             exception_type,
                             f"batch item {i} failed: {error_message}",
                         )
+                        if preserve_capture_backpressure and (
+                            result_pb.error_info.error_code
+                            == ErrorCodePB.HIDDEN_STATE_CAPTURE_BACKPRESSURE
+                        ):
+                            results.append(error)
+                            continue
+                        raise error
                     conversion_index = i
                     stream_state = StreamState()
                     output = trans_output(

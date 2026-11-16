@@ -1020,21 +1020,36 @@ std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr
         stream->reportError(selection_error.code(), selection_error.ToString());
     }
 
-    // Capture admission is request-level and deliberately best-effort. Only
-    // TP0 owns the Mooncake publisher; every other rank follows the later
-    // model-input capability consensus. A quota miss must not reject serving.
+    // Only zero-token explicit opt-in requires admission. Ordinary generation
+    // and legacy bare-zero prefill keep their best-effort serving contract.
     const auto& config = *stream->generateConfig();
-    if (model_config_.hidden_state_capture_layer_ids.empty() || pd_sep_config.role_type == RoleType::DECODE
-        || stream->hasError() || (!config.capture_hidden_states && !config.isPrefillOnly())) {
+    const auto  reject_required = [&](ErrorCode code, const std::string& message) {
+        if (config.requiresHiddenStateCaptureAdmission() && !stream->hasError()) {
+            stream->cancelHiddenStateCapture();
+            stream->reportError(code, message);
+        }
+    };
+    if (stream->hasError() || (!config.capture_hidden_states && !config.isPrefillOnly())) {
+        return stream;
+    }
+    if (pd_sep_config.role_type != RoleType::PREFILL && pd_sep_config.role_type != RoleType::PDFUSION) {
+        reject_required(ErrorCode::INVALID_PARAMS, "required hidden-state capture needs a target prefill role");
+        return stream;
+    }
+    if (model_config_.hidden_state_capture_layer_ids.empty()) {
+        reject_required(ErrorCode::EXECUTION_EXCEPTION, "required hidden-state capture is not configured");
         return stream;
     }
     if (config.capture_hidden_states && config.reuse_cache) {
+        reject_required(ErrorCode::INVALID_PARAMS, "required hidden-state capture conflicts with reuse_cache");
         RTP_LLM_LOG_WARNING(
             "skip hidden-state capture for request %ld: capture_hidden_states conflicts with reuse_cache",
             stream->streamId());
         return stream;
     }
     if (!stream->isHiddenStateCaptureCandidate()) {
+        reject_required(ErrorCode::INVALID_PARAMS,
+                        "request is ineligible for required full-context hidden-state capture");
         return stream;
     }
     const int64_t request_id = stream->streamId();
@@ -1048,13 +1063,25 @@ std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr
         } else {
             std::lock_guard<std::mutex> lock(capture_admission_mutex_);
             if (executor_) {
-                reservation = executor_->tryReserveHiddenStateCapture(request_id, stream->inputLength());
+                auto admission = executor_->tryReserveHiddenStateCapture(request_id, stream->inputLength());
+                if (!admission.ok()) {
+                    reject_required(admission.status().code(), admission.status().ToString());
+                } else {
+                    reservation = std::move(admission.value());
+                    if (!reservation || !reservation->active()) {
+                        reject_required(ErrorCode::EXECUTION_EXCEPTION,
+                                        "hidden-state capture admission returned no active reservation");
+                    }
+                }
+            } else {
+                reject_required(ErrorCode::CANCELLED, "hidden-state capture executor has stopped");
             }
         }
     } catch (const std::bad_alloc&) {
         throw;
     } catch (const std::exception& error) {
         RTP_LLM_LOG_WARNING("skip hidden-state capture admission for request %ld: %s", request_id, error.what());
+        reject_required(ErrorCode::EXECUTION_EXCEPTION, error.what());
     }
     stream->setHiddenStateCaptureReservation(std::move(reservation));
     return stream;

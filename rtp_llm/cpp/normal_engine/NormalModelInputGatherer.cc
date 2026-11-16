@@ -953,8 +953,14 @@ absl::StatusOr<GptModelInputs> NormalModelInputGatherer::gather(const StreamGrou
     // complete context forward only when every participating context stream was
     // admitted; skip_lm_head remains solely responsible for prefill-only responses.
     model_input.capture_hidden_states = all_context_capture_candidates;
-    if (config_.enable_hidden_state_capture && !model_input.capture_hidden_states) {
+    if (!model_input.capture_hidden_states) {
         for (const auto& stream : context_streams) {
+            if (stream->generateConfig()->requiresHiddenStateCaptureAdmission() && !stream->hasError()) {
+                // Preserve batch geometry and TP collective order, but never report
+                // successful required prefill when this gather suppresses capture.
+                stream->reportError(ErrorCode::EXECUTION_EXCEPTION,
+                                    "required hidden-state capture was disabled by the gathered batch");
+            }
             stream->cancelHiddenStateCapture();
         }
     }

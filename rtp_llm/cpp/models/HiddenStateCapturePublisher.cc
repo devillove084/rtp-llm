@@ -356,23 +356,35 @@ bool HiddenStateCapturePublisher::retainedBytes(const PublishTask& task, int64_t
     return true;
 }
 
-HiddenStateCaptureReservationPtr HiddenStateCapturePublisher::tryReserve(int64_t request_id, int64_t valid_tokens) {
-    int64_t bytes = 0;
-    if (!owner_ || !capture_enabled_.load(std::memory_order_acquire) || request_id < 0
-        || !payloadBytes(valid_tokens, bytes)) {
-        return {};
+HiddenStateCaptureAdmissionResult HiddenStateCapturePublisher::tryReserve(int64_t request_id, int64_t valid_tokens) {
+    if (!owner_) {
+        return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture publisher is not the owner"};
     }
+    int64_t bytes = 0;
     // Outlives the lock so allocation failures cannot run its cancellation
     // callback while holding state_mutex_.
     HiddenStateCaptureReservationPtr reservation;
     try {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (stopping_ || !capture_enabled_.load(std::memory_order_acquire)
-            || reservations_.find(request_id) != reservations_.end()
-            || reservations_.size() >= static_cast<size_t>(limits_.max_inflight_samples)
+        if (stopping_) {
+            return {ErrorCode::CANCELLED, "hidden-state capture publisher is stopping"};
+        }
+        if (!capture_enabled_.load(std::memory_order_acquire)) {
+            return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture publisher is disabled or failed"};
+        }
+        if (request_id < 0 || !payloadBytes(valid_tokens, bytes)) {
+            return {ErrorCode::INVALID_PARAMS, "invalid hidden-state capture request or payload size"};
+        }
+        if (bytes > limits_.max_inflight_bytes || valid_tokens > limits_.max_inflight_tokens) {
+            return {ErrorCode::INVALID_PARAMS, "hidden-state capture request exceeds total byte or token capacity"};
+        }
+        if (reservations_.find(request_id) != reservations_.end()) {
+            return {ErrorCode::INVALID_PARAMS, "hidden-state capture request ID already has a live reservation"};
+        }
+        if (reservations_.size() >= static_cast<size_t>(limits_.max_inflight_samples)
             || bytes > limits_.max_inflight_bytes - reserved_bytes_
             || valid_tokens > limits_.max_inflight_tokens - reserved_tokens_) {
-            return {};
+            return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "hidden-state capture quota is temporarily occupied"};
         }
         const auto generation = ++reservation_generation_;
         reservation           = std::make_shared<HiddenStateCaptureReservation>(
@@ -391,12 +403,12 @@ HiddenStateCaptureReservationPtr HiddenStateCapturePublisher::tryReserve(int64_t
         reservations_.emplace(request_id, Reservation{generation, valid_tokens, bytes, false, nullptr, {}, false});
         reserved_bytes_ += bytes;
         reserved_tokens_ += valid_tokens;
-        return reservation;
+        return std::move(reservation);
     } catch (const std::bad_alloc&) {
         throw;
     } catch (const std::exception& error) {
         RTP_LLM_LOG_WARNING("hidden-state capture reservation failed: %s", error.what());
-        return {};
+        return {ErrorCode::EXECUTION_EXCEPTION, error.what()};
     }
 }
 

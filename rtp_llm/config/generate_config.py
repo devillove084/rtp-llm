@@ -215,7 +215,10 @@ class GenerateConfig(BaseModel):
     return_incremental: bool = False
     return_hidden_states: bool = False
     return_all_hidden_states: bool = False
-    # Best-effort prompt capture requires reuse_cache=False; bare zero-token prefill stays eligible.
+    # Capture requires reuse_cache=False. Effective max_new_tokens == 0 plus
+    # capture=True uses strict admission: transient rejection precedes any
+    # reservation/publication. Bare zero-token prefill and positive-token capture
+    # remain best-effort (fail-open).
     capture_hidden_states: bool = False
     hidden_states_cut_dim: int = 0
     normalized_hidden_states: bool = False

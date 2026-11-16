@@ -256,6 +256,13 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
             ++forward_count;
             EXPECT_EQ(inputs.skip_lm_head, expected_prefill_only);
             EXPECT_EQ(inputs.capture_hidden_states, expected_capture_hidden_states);
+            if (check_context_geometry) {
+                EXPECT_EQ(inputs.combo_tokens.numel(), 4);
+                EXPECT_EQ(inputs.input_lengths.numel(), 2);
+                EXPECT_EQ(inputs.prefix_lengths.numel(), 2);
+                EXPECT_EQ(inputs.request_id.numel(), 2);
+                EXPECT_EQ(inputs.lm_output_indexes.numel(), 2);
+            }
             if (fail_forward) {
                 throw std::runtime_error("canonical model forward failed");
             }
@@ -273,6 +280,7 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
         bool expected_prefill_only          = true;
         bool expected_capture_hidden_states = false;
         bool fail_forward                   = false;
+        bool check_context_geometry         = false;
 
 
         int forward_count = 0;
@@ -298,6 +306,21 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
     };
     const std::vector<TestCase> cases = {
         {"prefill-only-legacy", 0, 0, false, false, true, true, false},
+        {"prefill-only-required", 0, 0, false, false, true, true, true},
+        {"prefill-only-required-without-admission", 0, 0, false, false, true, false, true, false, 1, 1, false},
+        {"prefill-only-required-without-global-config",
+         0,
+         0,
+         false,
+         false,
+         true,
+         false,
+         true,
+         false,
+         1,
+         1,
+         true,
+         false},
         {"generation-context-default", 1, 1, false, false, false, false, false},
         {"generation-context-explicit-capture", 1, 1, false, false, false, true, true},
         {"generation-context-reuse-conflict",
@@ -360,6 +383,9 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
         model->expected_prefill_only          = test_case.expected_prefill_only;
         model->expected_capture_hidden_states = test_case.expected_capture_hidden_states;
         model->fail_forward                   = test_case.fail_forward;
+        model->check_context_geometry = test_case.first_max_new_tokens == 0 && test_case.second_max_new_tokens == 0
+                                        && !test_case.first_has_error && !test_case.first_is_decode
+                                        && !test_case.second_is_decode;
 
 
         executor.setModel(std::move(model));
@@ -406,7 +432,7 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
         }
 
         EXPECT_EQ(observed_model->forward_count, 1);
-        if (test_case.capture_configured && !test_case.expected_capture_hidden_states) {
+        if (!test_case.expected_capture_hidden_states) {
             EXPECT_FALSE(first->hasHiddenStateCaptureReservation());
             EXPECT_FALSE(second->hasHiddenStateCaptureReservation());
         }
@@ -427,6 +453,16 @@ TEST_P(OutputDispatchTest, testExecutorUsesGatheredCaptureAndLmHeadModes) {
             EXPECT_EQ(second->stopReason(), kMixedExecutionModeBatchError);
             EXPECT_FALSE(first->hasOutput());
             EXPECT_FALSE(second->hasOutput());
+        } else if (second->generateConfig()->requiresHiddenStateCaptureAdmission()
+                   && !test_case.expected_capture_hidden_states) {
+            EXPECT_EQ(second->statusInfo().code(), ErrorCode::EXECUTION_EXCEPTION);
+            EXPECT_EQ(second->stopReason(), "required hidden-state capture was disabled by the gathered batch");
+            EXPECT_FALSE(second->hasOutput());
+            EXPECT_FALSE(second->hasHiddenStateCaptureReservation());
+            if (!test_case.first_has_error && first->generateConfig()->requiresHiddenStateCaptureAdmission()) {
+                EXPECT_EQ(first->statusInfo().code(), ErrorCode::EXECUTION_EXCEPTION);
+                EXPECT_FALSE(first->hasOutput());
+            }
         } else {
             ASSERT_FALSE(second->hasError());
             auto output = second->nextOutput();

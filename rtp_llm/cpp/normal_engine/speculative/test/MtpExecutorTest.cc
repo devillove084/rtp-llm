@@ -278,8 +278,11 @@ public:
         model_id_ = params.model_id;
     }
 
-    HiddenStateCaptureReservationPtr tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override {
+    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override {
         capture_reservation_attempts_.emplace_back(request_id, valid_tokens);
+        if (!capture_admission_) {
+            return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "test capture quota occupied"};
+        }
         return std::exchange(capture_admission_, {});
     }
 
@@ -1225,8 +1228,11 @@ public:
         const auto request_id = target_only_stream->streamId();
         auto       reservation =
             components.executor->tryReserveHiddenStateCapture(request_id, target_only_stream->inputLength());
-        ASSERT_EQ(reservation, capture_reservation);
-        target_only_stream->setHiddenStateCaptureReservation(std::move(reservation));
+        ASSERT_EQ(reservation.ok(), !reject_capture_admission);
+        EXPECT_EQ(reservation.status().code(), reject_capture_admission ?
+                      ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE : ErrorCode::NONE_ERROR);
+        ASSERT_EQ(reservation.value(), capture_reservation);
+        target_only_stream->setHiddenStateCaptureReservation(std::move(reservation.value()));
         EXPECT_EQ(target_only_stream->hasHiddenStateCaptureReservation(), !reject_capture_admission);
         ASSERT_FALSE(target_only_stream->hasError());
         auto status = components.executor->process(ScheduleOutput{{target_only_stream}});
@@ -1766,8 +1772,9 @@ void MtpExecutorTest::runSingleBatchPrefillScenario(bool                        
         target_model->setCaptureAdmission(std::make_shared<HiddenStateCaptureReservation>([]() noexcept {}));
         auto reservation =
             components.executor->tryReserveHiddenStateCapture(stream1->streamId(), stream1->inputLength());
-        ASSERT_NE(reservation, nullptr);
-        stream1->setHiddenStateCaptureReservation(std::move(reservation));
+        ASSERT_TRUE(reservation.ok());
+        ASSERT_NE(reservation.value(), nullptr);
+        stream1->setHiddenStateCaptureReservation(std::move(reservation.value()));
     }
     if (simulate_cp_mutation && !with_cp_hidden_buffers) {
         EXPECT_FALSE(target_model->hasMtpTargetHiddenBuffer());
@@ -2029,8 +2036,11 @@ TEST_F(MtpExecutorTest, testCaptureReservationRoutesPresetAdmissionOnlyToTargetM
                             std::move(components.fake_draft_prefill_model));
             const auto request_id  = stream->streamId();
             auto       reservation = components.executor->tryReserveHiddenStateCapture(request_id, 4);
-            EXPECT_EQ(reservation, preset);
-            stream->setHiddenStateCaptureReservation(std::move(reservation));
+            EXPECT_EQ(reservation.ok(), admitted);
+            EXPECT_EQ(reservation.status().code(), admitted ? ErrorCode::NONE_ERROR :
+                                                            ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE);
+            EXPECT_EQ(reservation.value(), preset);
+            stream->setHiddenStateCaptureReservation(std::move(reservation.value()));
             EXPECT_EQ(stream->hasHiddenStateCaptureReservation(), admitted);
             EXPECT_EQ(target->captureReservationAttempts(), (vector<pair<int64_t, int64_t>>{{request_id, 4}}));
             EXPECT_TRUE(draft->captureReservationAttempts().empty());
@@ -2040,7 +2050,8 @@ TEST_F(MtpExecutorTest, testCaptureReservationRoutesPresetAdmissionOnlyToTargetM
 
             // This token must not capture a model or Executor just to cancel.
             components.executor->setTargetModel(nullptr);
-            EXPECT_FALSE(components.executor->tryReserveHiddenStateCapture(request_id, 4));
+            EXPECT_EQ(components.executor->tryReserveHiddenStateCapture(request_id, 4).status().code(),
+                      ErrorCode::EXECUTION_EXCEPTION);
             components.executor.reset();
             stream->cancelHiddenStateCapture();
             stream->cancelHiddenStateCapture();
@@ -2886,8 +2897,9 @@ void MtpExecutorTest::runSingleBatchDecodeScenario(bool                         
         fake_target_model->setCaptureAdmission(std::make_shared<HiddenStateCaptureReservation>([]() noexcept {}));
         auto reservation = components.executor->tryReserveHiddenStateCapture(prefill_only_stream->streamId(),
                                                                              prefill_only_stream->inputLength());
-        ASSERT_NE(reservation, nullptr);
-        prefill_only_stream->setHiddenStateCaptureReservation(std::move(reservation));
+        ASSERT_TRUE(reservation.ok());
+        ASSERT_NE(reservation.value(), nullptr);
+        prefill_only_stream->setHiddenStateCaptureReservation(std::move(reservation.value()));
         EXPECT_TRUE(prefill_only_stream->hasHiddenStateCaptureReservation());
     }
     // Verify executor was created successfully
