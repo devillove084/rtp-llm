@@ -23,13 +23,19 @@ class FilePublisherCpuTest(unittest.TestCase):
     def setUpClass(cls):
         if os.environ.get('CUDA_VISIBLE_DEVICES') != '' or torch.cuda.is_available():
             raise RuntimeError('run the publisher CPU tests with CUDA_VISIBLE_DEVICES empty')
+        kernel = 'rtp_llm.utils.hidden_state_file_fp8_kernel'
+        cls.kernel_imports = []
+
         class BlockStoreDependencies:
             def find_spec(self, fullname, path=None, target=None):
+                if fullname == kernel:
+                    cls.kernel_imports.append(fullname)
+                    raise AssertionError('CPU publisher imported the file FP8 kernel')
                 if fullname.split('.')[0] in ('torchspec', 'mooncake'):
                     raise AssertionError(f'file publisher imported {fullname}')
                 return None
 
-        if any(n.split('.')[0] in ('torchspec', 'mooncake') for n in sys.modules):
+        if kernel in sys.modules or any(n.split('.')[0] in ('torchspec', 'mooncake') for n in sys.modules):
             raise RuntimeError('file publisher regression requires a fresh process')
         blocker = BlockStoreDependencies()
         sys.meta_path.insert(0, blocker)
@@ -40,6 +46,7 @@ class FilePublisherCpuTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.addCleanup(self.assertEqual, self.kernel_imports, [])
         self.root = Path(tmp.name)
         env = patch.dict(os.environ, RTP_HIDDEN_STATE_CAPTURE_3FS_DIR=tmp.name,
                          RTP_HIDDEN_STATE_CAPTURE_3FS_LOCAL_PROTOCOL_TEST_ONLY='1',
@@ -134,8 +141,33 @@ class FilePublisherCpuTest(unittest.TestCase):
         if out := os.environ.get('TEST_UNDECLARED_OUTPUTS_DIR'):
             (Path(out) / 'timeline.json').write_bytes(timeline.read_bytes())
 
+    @patch.dict(os.environ, RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8='1')
+    def test_fp8_fallback_packs_one_batch_before_splitting_requests(self):
+        from rtp_llm.utils import hidden_state_file_contract as contract
+
+        with patch.object(contract, 'quantize_aux_hidden_states', wraps=contract.quantize_aux_hidden_states) as quantize:
+            publisher = self.publisher(fp8=True, samples=2)
+            quantize.assert_not_called()
+            packed = torch.arange(18, dtype=torch.float16).reshape(3, 6)[:, ::2]
+            tickets = [publisher.reserve(i, n, strict=True).reservation for i, n in [(511, 1), (512, 2)]]
+            self.assertTrue(publisher.submit(packed, torch.arange(3), torch.tensor([1, 2], dtype=torch.int32),
+                                             torch.tensor([511, 512]), 3, 'FP8 batch split'))
+            self.assert_released(publisher)
+            quantize.assert_called_once()
+            aux, layers = quantize.call_args.args
+            self.assertEqual(layers, 2)
+            self.assertTrue(aux.is_contiguous())
+            torch.testing.assert_close(aux, packed[:, :2])
+        codes, scales = contract.quantize_aux_hidden_states(aux, layers)
+        for ticket, key, rows in zip(tickets, [511, 512], [slice(0, 1), slice(1, 3)]):
+            self.assertEqual(ticket.publication(), (0, ''))
+            fields = self.reader.read(f'rtp_CpuTest_{key}')['tensors']
+            torch.testing.assert_close(fields['hidden_states'].view(torch.uint8), codes[rows].view(torch.uint8))
+            torch.testing.assert_close(fields['hidden_states_scale'], scales[rows], rtol=0, atol=0)
+            torch.testing.assert_close(fields['last_hidden_states'], packed[rows, 2:].bfloat16())
+
     def test_no_reservation_or_backpressure_is_not_publication(self):
-        publisher = self.publisher()
+        publisher = self.publisher(fp8=True)
         held = publisher.reserve(601, 2)
         self.assertTrue(held.ok)
         self.assertFalse(publisher.reserve(602, 2).ok)

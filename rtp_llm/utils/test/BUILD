@@ -353,3 +353,34 @@ py_test(
     env_inherit = ["RTP_TEST_TORCHSPEC_ARCHIVE"],
     tags = ["manual"],
 )
+
+py_test(
+    name = "hidden_state_file_fp8_kernel_cpu_test",
+    srcs = ["hidden_state_file_fp8_kernel_test.py"],
+    main = "hidden_state_file_fp8_kernel_test.py",
+    args = ["CpuRouteTest"],
+    deps = ["//rtp_llm:torch", "//rtp_llm:utils"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "GPU_COUNT": "0"},
+)
+
+[
+    py_test(
+        name = "hidden_state_file_fp8_kernel" + suffix + "_test",
+        srcs = ["hidden_state_file_fp8_kernel_test.py"],
+        main = "hidden_state_file_fp8_kernel_test.py",
+        args = ["CudaContractTest"],
+        deps = [":triton", "//rtp_llm:torch", "//rtp_llm:utils"],
+        target_compatible_with = select({
+            config: [],
+            "//conditions:default": ["@platforms//:incompatible"],
+        }),
+        env = {"FILE_FP8_TEST_SM": sm, "GPU_COUNT": "1"},
+        tags = [gpu] + extra_tags,
+        exec_properties = {"gpu": gpu, "gpu_count": "1"},
+    )
+    for suffix, config, gpu, sm, extra_tags in [
+        ("", "@//:using_cuda13_x86", "H20_CU13", "9.0", []),
+        ("_sm100", "@//:using_cuda13_arm", "SM100_ARM_CU13", "10.0", ["manual"]),
+        ("_sm120", "@//:using_cuda13_x86", "RTX_5000_PRO_CU13", "12.0", ["manual"]),
+    ]
+]

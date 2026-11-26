@@ -226,6 +226,7 @@ private:
     const bool                    owner_;
     const HiddenStateCaptureStorageConfig storage_;
     const std::string             file_store_dir_;
+    const bool                    fused_file_fp8_{false};
     const bool                    trace_enabled_;
     std::string                   store_key_namespace_;
     kmonitor::MetricsReporterPtr  metrics_reporter_;
@@ -281,6 +282,7 @@ private:
     pybind11::object store_;
     pybind11::object trace_mark_;
     pybind11::object quantize_fn_;
+    pybind11::object file_pack_fn_;
     pybind11::object host_buffer_too_small_type_;
 };
 

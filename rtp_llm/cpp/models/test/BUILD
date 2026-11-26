@@ -147,7 +147,7 @@ py_test(
     name = "pywrapped_model_cache_store_integration_test",
     srcs = ["pywrapped_model_cache_store_integration_test.py"],
     data = pywrapped_model_test_data,
-    deps = pywrapped_model_test_deps,
+    deps = pywrapped_model_test_deps + ["//rtp_llm:utils"],
     env = {"TEST_USING_DEVICE": "CUDA"},
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],
@@ -169,13 +169,17 @@ py_test(
     main = "pywrapped_model_cache_store_integration_test.py",
     srcs = ["pywrapped_model_cache_store_integration_test.py"],
     args = [
+        "FileFp8WorkerTest.test_cold_worker_file_roundtrip",
         "PyWrappedModelCacheStoreIntegrationTest.test_dirty_generation_prefill_capture_does_not_retain_cache_manager",
     ],
     data = pywrapped_model_test_data,
     deps = pywrapped_model_test_deps + [
+        "//rtp_llm:triton",
+        "//rtp_llm:utils",
         "//rtp_llm/models_py:modules",
     ],
     env = {
+        "RTP_TEST_FILE_FP8_WORKER": "1",
         "ENABLE_CUDA_GRAPH_DEBUG_MODE": "1",
         "NOT_USE_DEFAULT_STREAM": "1",
         "RTP_LLM_RUN_PYWRAPPED_DIRTY_CAPTURE_TEST": "1",

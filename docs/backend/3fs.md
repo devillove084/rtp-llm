@@ -87,3 +87,13 @@ Check if /dev/shm is the requested size, such as 40GB. If not, confirm that the 
 Considering the group's RDMA network architecture, there will be RDMA performance loss when communicating between different network clusters, so currently one network cluster deploys a separate 3FS storage cluster.
 
 3FS has already been deployed in HPAI NA61, NA175, Kingsoft Cloud, and Beijing Lingjun data centers. Deployment in other data centers is ongoing.
+
+## Experimental fused FP8 packing for hidden-state file capture
+
+For a publisher already configured to write hidden states to a mounted file directory with `hidden_state_capture_dtype="fp8_e4m3"`, set this **before starting the service** to opt in:
+
+```shell
+export RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8=1
+```
+
+Only the exact value `1` enables the experiment. If unset or `0`, the publisher uses its existing FP8 quantizer without importing the fused kernel. Each publisher reads the flag once at construction. Even with `1`, inputs not supported by the fused CUDA kernel use the existing quantizer. This flag does not select the capture dtype, enable capture or change BF16, Mooncake or KV-cache behavior.

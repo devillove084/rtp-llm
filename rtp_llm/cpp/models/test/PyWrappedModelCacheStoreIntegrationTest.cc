@@ -2106,7 +2106,7 @@ void registerCapturePublisher(py::module_& m) {
                          const std::vector<int64_t>& layer_ids,
                          int64_t                    poll_interval_ms,
                          std::optional<std::string> storage_dir, int64_t io_workers, int64_t io_depth,
-                         std::string compression, int64_t compression_level) {
+                         std::string compression, int64_t compression_level, int64_t hidden_size) {
                  rtp_llm::HiddenStateCaptureLimits limits{samples, bytes, tokens, batches, poll_interval_ms};
                  auto                              dtype = torch::kFloat16;
                  if (model_dtype == "bfloat16")
@@ -2118,7 +2118,7 @@ void registerCapturePublisher(py::module_& m) {
                  else if (model_dtype != "float16")
                      throw std::invalid_argument("unsupported test model dtype");
                  return std::make_unique<Publisher>(2,
-                                                    1,
+                                                    hidden_size,
                                                     fp8 ? rtp_llm::HiddenStateCaptureDtype::FP8_E4M3 :
                                                           rtp_llm::HiddenStateCaptureDtype::BF16,
                                                     dtype,
@@ -2140,7 +2140,7 @@ void registerCapturePublisher(py::module_& m) {
              py::arg("layer_ids")        = std::vector<int64_t>{0, 1},
              py::arg("poll_interval_ms") = 1000, py::arg("storage_dir") = py::none(),
              py::arg("io_workers") = 2, py::arg("io_depth") = 2,
-             py::arg("compression") = "none", py::arg("compression_level") = 1)
+             py::arg("compression") = "none", py::arg("compression_level") = 1, py::arg("hidden_size") = 1)
         .def("metrics", [](Publisher& publisher) {
             return rtp_llm::test::FakeMetricsReporter(Peer::captureMetricsReporter(publisher))
                 .snapshotHiddenStateCaptureMetrics();

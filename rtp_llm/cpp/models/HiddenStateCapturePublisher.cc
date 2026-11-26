@@ -361,6 +361,10 @@ HiddenStateCapturePublisher::HiddenStateCapturePublisher(int64_t                
     owner_(owner),
     storage_(std::move(storage)),
     file_store_dir_(storage_.resolvedStorageDir()),
+#if USING_CUDA
+    fused_file_fp8_(owner_ && !file_store_dir_.empty() && capture_dtype_ == HiddenStateCaptureDtype::FP8_E4M3
+                    && std::string_view(envOrEmpty("RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8")) == "1"),
+#endif
     trace_enabled_(*envOrEmpty("RTP_HIDDEN_STATE_CAPTURE_TRACE_DIR") != 0),
     metrics_reporter_(owner ? std::move(metrics_reporter) : nullptr) {
     capture_enabled_metric_ = registerKmonStatusMetric(metrics_reporter_, "rtp_llm_hidden_state_capture_enabled");
@@ -425,6 +429,7 @@ HiddenStateCapturePublisher::~HiddenStateCapturePublisher() {
     (void)store_.release();
     (void)trace_mark_.release();
     (void)quantize_fn_.release();
+    (void)file_pack_fn_.release();
     (void)host_buffer_too_small_type_.release();
 }
 
@@ -1288,31 +1293,21 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
             metrics.token_count = task.input_ids.numel();
 
             torch::Tensor stored_auxiliary;
-            torch::Tensor stored_last_hidden = perform(FailureStage::PREPARE,
-                                                       FailureDisposition::OPERATIONAL,
-                                                       "failed to prepare last hidden states for storage",
-                                                       [&]() {
-                                                           py::gil_scoped_release release;
-                                                           return last_hidden_states.to(torch::kBFloat16).contiguous();
-                                                       });
+            torch::Tensor stored_last_hidden;
             torch::Tensor hidden_states_scale;
-            if (capture_dtype_ == HiddenStateCaptureDtype::FP8_E4M3) {
-                batch_stage = FailureStage::QUANTIZE;
-                auto quantizer_input = perform(FailureStage::QUANTIZE,
-                                               FailureDisposition::OPERATIONAL,
-                                               "failed to prepare TorchSpec FP8 quantizer input",
-                                               [&]() {
-                                                   py::gil_scoped_release release;
-                                                   return auxiliary_hidden_view.contiguous();
-                                               });
-                RTP_LLM_PROFILE_SCOPE("hidden_state_capture.quantize");
+            const auto quantize = [&](bool packed_file, auto&& invoke) {
+                RTP_LLM_PROFILE_SCOPE(packed_file ? "hidden_state_capture.file_fp8_pack" : "hidden_state_capture.quantize");
                 metrics.has_quantize_latency = true;
                 quantize_start_us            = autil::TimeUtility::currentTimeInMicroSeconds();
-                py::object quantized_result  = perform(FailureStage::QUANTIZE,
-                                                      FailureDisposition::OPERATIONAL,
-                                                      "TorchSpec FP8 quantizer execution failed",
-                                                      [&]() { return quantize_fn_(quantizer_input, layer_count_); });
-                auto       quantized_tensors = perform(
+                py::object quantized_result = perform(
+                    FailureStage::QUANTIZE, FailureDisposition::OPERATIONAL,
+                    packed_file ? "file FP8 pack failed" : "TorchSpec FP8 quantizer execution failed", invoke);
+                if (packed_file && quantized_result.is_none()) {
+                    // The fallback times only its quantizer, never a declined probe or payload copies.
+                    metrics.has_quantize_latency = false;
+                    return;
+                }
+                auto quantized_tensors = perform(
                     FailureStage::QUANTIZE,
                     FailureDisposition::HARD_CONTRACT,
                     "TorchSpec FP8 quantizer returned an invalid result",
@@ -1321,24 +1316,34 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                             throw std::runtime_error("TorchSpec FP8 quantizer must return tensor and scale");
                         }
                         py::tuple quantized = quantized_result.cast<py::tuple>();
-                        if (quantized.size() != 2) {
+                        if (packed_file) {
+                            if (quantized.size() != 3) {
+                                throw std::runtime_error("file FP8 pack must return codes, scales and final hidden states");
+                            }
+                            stored_last_hidden = quantized[2].cast<torch::Tensor>();
+                            if (!stored_last_hidden.defined() || stored_last_hidden.sizes() != last_hidden_states.sizes()
+                                || stored_last_hidden.scalar_type() != torch::kBFloat16
+                                || stored_last_hidden.device() != task.packed.device() || !stored_last_hidden.is_contiguous()) {
+                                throw std::runtime_error("file FP8 final hidden states must preserve the BF16 final layout");
+                            }
+                        } else if (quantized.size() != 2) {
                             throw std::runtime_error("TorchSpec FP8 quantizer must return tensor and scale");
                         }
                         auto quantized_hidden = quantized[0].cast<torch::Tensor>();
                         auto quantized_scale  = quantized[1].cast<torch::Tensor>();
                         if (!quantized_hidden.defined() || quantized_hidden.dim() != 2
-                            || quantized_hidden.size(0) != quantizer_input.size(0)
-                            || quantized_hidden.size(1) != quantizer_input.size(1)
+                            || quantized_hidden.size(0) != auxiliary_hidden_view.size(0)
+                            || quantized_hidden.size(1) != auxiliary_hidden_view.size(1)
                             || quantized_hidden.scalar_type() != TORCH_FP8_E4M3_TYPE
-                            || quantized_hidden.device() != quantizer_input.device()) {
+                            || quantized_hidden.device() != task.packed.device()) {
                             throw std::runtime_error("TorchSpec FP8 quantized hidden states must preserve the "
                                                            "auxiliary tensor layout");
                         }
                         if (!quantized_scale.defined() || quantized_scale.dim() != 2
-                            || quantized_scale.size(0) != quantizer_input.size(0)
+                            || quantized_scale.size(0) != auxiliary_hidden_view.size(0)
                             || quantized_scale.size(1) != layer_count_
                             || quantized_scale.scalar_type() != torch::kFloat32
-                            || quantized_scale.device() != quantizer_input.device()) {
+                            || quantized_scale.device() != task.packed.device()) {
                             throw std::runtime_error("TorchSpec FP8 scale must have shape [T, "
                                                      + std::to_string(layer_count_) + "] on the capture device");
                         }
@@ -1348,15 +1353,44 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                 hidden_states_scale         = std::move(quantized_tensors.second);
                 metrics.quantize_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - quantize_start_us;
                 quantize_latency_completed  = true;
+            };
+#if USING_CUDA
+            // The producer fence and per-request length checks precede this batch-wide pack.
+            if (fused_file_fp8_ && task.packed.is_cuda() && !task.packed.is_neg() && !task.packed.is_nested()
+                && (model_dtype_ == torch::kBFloat16 || model_dtype_ == torch::kFloat16 || model_dtype_ == torch::kFloat32)) {
+                batch_stage = FailureStage::QUANTIZE;
+                quantize(true, [&] {
+                    if (!file_pack_fn_) {
+                        file_pack_fn_ = py::module_::import("rtp_llm.utils.hidden_state_file_fp8_kernel")
+                                            .attr("try_pack_file_fp8");
+                    }
+                    return file_pack_fn_(task.packed, layer_count_);
+                });
                 batch_stage = FailureStage::PREPARE;
-            } else {
-                stored_auxiliary = perform(FailureStage::PREPARE,
-                                           FailureDisposition::OPERATIONAL,
-                                           "failed to prepare BF16 auxiliary hidden states for storage",
-                                           [&]() {
-                                               py::gil_scoped_release release;
-                                               return auxiliary_hidden_view.to(torch::kBFloat16).contiguous();
-                                           });
+            }
+#endif
+            if (!stored_last_hidden.defined()) {
+                stored_last_hidden = perform(FailureStage::PREPARE, FailureDisposition::OPERATIONAL,
+                                             "failed to prepare last hidden states for storage", [&] {
+                    py::gil_scoped_release release;
+                    return last_hidden_states.to(torch::kBFloat16).contiguous();
+                });
+                if (capture_dtype_ == HiddenStateCaptureDtype::FP8_E4M3) {
+                    batch_stage = FailureStage::QUANTIZE;
+                    auto quantizer_input = perform(FailureStage::QUANTIZE, FailureDisposition::OPERATIONAL,
+                                                   "failed to prepare TorchSpec FP8 quantizer input", [&] {
+                        py::gil_scoped_release release;
+                        return auxiliary_hidden_view.contiguous();
+                    });
+                    quantize(false, [&] { return quantize_fn_(quantizer_input, layer_count_); });
+                    batch_stage = FailureStage::PREPARE;
+                } else {
+                    stored_auxiliary = perform(FailureStage::PREPARE, FailureDisposition::OPERATIONAL,
+                                               "failed to prepare BF16 auxiliary hidden states for storage", [&] {
+                        py::gil_scoped_release release;
+                        return auxiliary_hidden_view.to(torch::kBFloat16).contiguous();
+                    });
+                }
             }
 
             torch::Tensor stored_input_ids;
@@ -2255,6 +2289,7 @@ void HiddenStateCapturePublisher::quarantineResources() noexcept {
     (void)trace_mark_.release();
     (void)key_provider_.release();
     (void)quantize_fn_.release();
+    (void)file_pack_fn_.release();
     (void)host_buffer_too_small_type_.release();
     try {
         recordQuota(true);
@@ -2687,6 +2722,7 @@ void HiddenStateCapturePublisher::flushAndClose() noexcept {
                 trace_mark_ = py::object();
                 store_ = py::object();
                 quantize_fn_     = py::object();
+                file_pack_fn_    = py::object();
                 host_buffer_too_small_type_ = py::object();
                 key_provider_ = py::object();
             }

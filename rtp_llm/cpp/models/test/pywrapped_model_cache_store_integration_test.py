@@ -2151,7 +2151,26 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         if len(capture_events) == 4:
             self.assertLessEqual(capture_events[1].time_range.end, capture_events[2].time_range.start)
 
+    def blockFilePackImport(self):
+        name = "rtp_llm.utils.hidden_state_file_fp8_kernel"
+        self.assertNotIn(name, sys.modules)
+        attempts = []
+
+        class BlockFilePack:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == name:
+                    attempts.append(fullname)
+                    raise AssertionError("unexpected file FP8 kernel import")
+                return None
+
+        blocker = BlockFilePack()
+        sys.meta_path.insert(0, blocker)
+        self.addCleanup(sys.meta_path.remove, blocker)
+        self.addCleanup(self.assertEqual, attempts, [])
+
+    @patch.dict(os.environ, RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8="1")
     def test_capture_profile_scopes_preserve_forward_contract(self) -> None:
+        self.blockFilePackImport()
         _register_identity_allreduce()
         self.addCleanup(clear_comm_ops)
         scenarios = [
@@ -3561,7 +3580,9 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
                             publisher.close()
                         self.assertEqual(publisher.fatal, fatal)
 
+    @patch.dict(os.environ, RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8="1")
     def test_capture_quota_counts_source_dtype_ids_metadata_and_store(self) -> None:
+        self.blockFilePackImport()
         # L=2, H=1, T=2; IDs use 8 bytes per token on each side.
         # Each request also retains int32 length + int64 ID tensor + int64 ledger.
         for dtype, fp8, expected_bytes in (
@@ -4054,6 +4075,86 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             [put["key"] for put in _FakeEagleMooncakeStore.instances[-1].puts],
             ["rtp_TestActor_1", "rtp_TestActor_2"],
         )
+
+    @unittest.skipIf(os.environ.get("TEST_USING_DEVICE") == "ROCM", "NVIDIA file FP8 dispatch")
+    def test_file_pack_dispatch_on_admitted_worker_stream(self) -> None:
+        from rtp_llm.utils import hidden_state_file_contract as contract
+        from rtp_llm.utils.hidden_state_file_store import FileCaptureReader
+
+        kernel_name = "rtp_llm.utils.hidden_state_file_fp8_kernel"
+        kernel = types.ModuleType(kernel_name)
+        producer = torch.cuda.Stream()
+        reference = contract.quantize_aux_hidden_states
+        flag = "RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8"
+        for mode in ("unset", "zero", "packed", "decline", "bf16", "fatal"):
+            expect_pack = mode in ("packed", "decline", "fatal")
+            with (
+                self.subTest(mode=mode),
+                tempfile.TemporaryDirectory() as root,
+                patch.dict(os.environ, RTP_HIDDEN_STATE_CAPTURE_3FS_LOCAL_PROTOCOL_TEST_ONLY="1",
+                           RTP_HIDDEN_STATE_CAPTURE_KEY_NAMESPACE="FilePack"),
+                patch.dict(sys.modules, {kernel_name: None}),
+                patch.object(contract, "quantize_aux_hidden_states", wraps=reference) as fallback,
+            ):
+                calls = []
+
+                def pack(source, layers):
+                    calls.append((source.data_ptr(), source.stride(), layers, torch.cuda.current_stream(), threading.get_ident()))
+                    if mode == "decline":
+                        return None
+                    if mode == "fatal":
+                        raise torch.distributed.DistError("injected file pack failure")
+                    return (*reference(source[:, :2], layers), source[:, 2:].bfloat16().contiguous())
+
+                kernel.try_pack_file_fp8 = pack
+                if mode == "unset":
+                    os.environ.pop(flag, None)
+                else:
+                    os.environ[flag] = "0" if mode == "zero" else "1"
+                publisher = self.capturePublisher(fp8=mode != "bf16", storage_dir=root, layer_ids=[7, 2])
+                try:
+                    # Changing the flag after construction must not change this publisher's dispatch.
+                    os.environ[flag] = "1" if mode in ("unset", "zero") else "0"
+                    ids = torch.arange(3)
+                    requests = torch.tensor([41, 42])
+                    lengths = torch.tensor([1, 2], dtype=torch.int32)
+                    with torch.cuda.stream(producer):
+                        packed = torch.arange(18, device="cuda", dtype=torch.float16).reshape(3, 6)[:, ::2]
+                        self.assertFalse(publisher.submit(packed, ids, lengths, requests, 3, "unreserved"))
+                    self.assertFalse(calls)
+                    if expect_pack:
+                        sys.modules[kernel_name] = kernel
+                    tickets = [publisher.reserve(i, n, strict=True).reservation for i, n in [(41, 1), (42, 2)]]
+                    with torch.cuda.stream(producer):
+                        self.assertTrue(publisher.submit(packed, ids, lengths, requests, 3, mode))
+                    self.assertTrue(publisher.drain())
+                    self.assertEqual(len(calls), int(expect_pack))
+                    if calls:
+                        ptr, strides, layers, stream, tid = calls[0]
+                        self.assertEqual((ptr, strides, layers), (packed.data_ptr(), packed.stride(), 2))
+                        self.assertNotEqual(stream, producer)
+                        self.assertNotEqual(tid, threading.get_ident())
+                    self.assertEqual(fallback.call_count, int(mode in ("unset", "zero", "decline")))
+                    self.assertEqual(publisher.fatal, mode == "fatal", publisher.diagnostic)
+                    if mode == "fatal":
+                        self.assertTrue(all(t.publication()[0] != 0 for t in tickets))
+                        self.assertEqual(publisher.inflight_samples, 2)
+                        continue
+                    self.assertEqual((publisher.inflight_samples, publisher.inflight_bytes), (0, 0))
+                    expected = packed.cpu()
+                    codes, scales = reference(packed[:, :2].contiguous(), 2)
+                    reader = FileCaptureReader(root)
+                    for ticket, key, rows in zip(tickets, [41, 42], [slice(0, 1), slice(1, 3)]):
+                        self.assertEqual(ticket.publication(), (0, ""))
+                        fields = reader.read(f"rtp_FilePack_{key}")["tensors"]
+                        torch.testing.assert_close(fields["last_hidden_states"], expected[rows, 2:].bfloat16())
+                        if mode == "bf16":
+                            torch.testing.assert_close(fields["hidden_states"], expected[rows, :2].bfloat16())
+                        else:
+                            torch.testing.assert_close(fields["hidden_states"].view(torch.uint8), codes[rows].view(torch.uint8).cpu())
+                            torch.testing.assert_close(fields["hidden_states_scale"], scales[rows].cpu(), rtol=0, atol=0)
+                finally:
+                    publisher.close()
 
     def test_capture_nondefault_producer_stream_and_async_pinned_lengths(self) -> None:
         publisher = self.capturePublisher()
@@ -6338,6 +6439,76 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertCaptureStatus(metrics, enabled=0, broken=0)
         self.assertIn(f"{_CAPTURE_METRIC_PREFIX}publish_latency_us", metrics)
         self.assertIn(f"{_CAPTURE_METRIC_PREFIX}store_put_latency_us", metrics)
+
+
+@unittest.skipUnless(os.environ.get("RTP_TEST_FILE_FP8_WORKER") == "1", "requires the H20 file-worker lane")
+class FileFp8WorkerTest(unittest.TestCase):
+    def test_cold_worker_file_roundtrip(self):
+        root = os.environ.get("RTP_TEST_COLD_FP8_ROOT")
+        if root is None:
+            # Isolate the JIT and CUDA context from the dirty graph test in this target.
+            with tempfile.TemporaryDirectory() as root:
+                subprocess.run([sys.executable, os.path.abspath(__file__), "FileFp8WorkerTest.test_cold_worker_file_roundtrip"],
+                               env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path),
+                                        RTP_TEST_COLD_FP8_ROOT=root, TRITON_CACHE_DIR=str(Path(root) / "jit"),
+                                        RTP_HIDDEN_STATE_CAPTURE_FUSED_FP8="1", RTP_HIDDEN_STATE_CAPTURE_KEY_NAMESPACE="Cold",
+                                        RTP_HIDDEN_STATE_CAPTURE_3FS_LOCAL_PROTOCOL_TEST_ONLY="1"),
+                               check=True, timeout=180)
+            return
+
+        from rtp_llm.utils.hidden_state_file_contract import quantize_aux_hidden_states
+        from rtp_llm.utils.hidden_state_file_store import FileCaptureReader
+
+        self.assertNotEqual(os.environ.get("TRITON_INTERPRET"), "1")
+        kernel_name = "rtp_llm.utils.hidden_state_file_fp8_kernel"
+        self.assertNotIn(kernel_name, sys.modules)
+        imports = []
+
+        class ObserveImport:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == kernel_name:
+                    imports.append((threading.get_ident(), torch.cuda.current_stream()))
+                return None  # Observe the real import without supplying a loader or module.
+
+        observer = ObserveImport()
+        sys.meta_path.insert(0, observer)
+        self.addCleanup(sys.meta_path.remove, observer)
+        width = 129
+        publisher = _extension.CapturePublisher(fp8=True, model_dtype="float32", hidden_size=width,
+                                                storage_dir=root, layer_ids=[7, 2])
+        self.addCleanup(publisher.close)
+        self.assertTrue(publisher.drain())
+        tickets = [publisher.reserve(i, n, strict=True).reservation for i, n in [(71, 1), (72, 3)]]
+        self.assertTrue(all(tickets), publisher.diagnostic)
+        self.assertFalse(imports)
+        producer = torch.cuda.Stream()
+        ids = torch.arange(4)
+        with torch.cuda.stream(producer):
+            backing = torch.arange(4 * (6 * width + 2), dtype=torch.float32, device="cuda").reshape(4, -1)
+            packed = backing[:, 1:-1:2].mul_(0.03125).sub_(40)
+            lengths = torch.empty(2, dtype=torch.int32, pin_memory=True)
+            lengths.copy_(torch.tensor([1, 3], dtype=torch.int32, device="cuda"), non_blocking=True)
+            self.assertTrue(publisher.submit(packed, ids, lengths, torch.tensor([71, 72]), 4, "cold file pack"))
+        self.assertTrue(publisher.drain(120000), publisher.diagnostic)
+        self.assertFalse(publisher.fatal, publisher.diagnostic)
+        self.assertEqual([t.publication() for t in tickets], [(0, ""), (0, "")], publisher.diagnostic)
+        self.assertEqual((publisher.inflight_samples, publisher.inflight_bytes), (0, 0))
+        (worker_tid, worker_stream), = imports
+        self.assertNotEqual(worker_tid, threading.get_ident())
+        self.assertNotIn(worker_stream, (producer, torch.cuda.default_stream()))
+        # A reference-only fallback can write identical files, but cannot compile this kernel.
+        self.assertTrue(any(Path(os.environ["TRITON_CACHE_DIR"]).rglob("kernel.cubin")))
+        codes, scales = quantize_aux_hidden_states(packed[:, :2 * width].contiguous(), 2)
+        expected = dict(hidden_states=codes.cpu(), hidden_states_scale=scales.cpu(), input_ids=ids,
+                        last_hidden_states=packed[:, 2 * width:].bfloat16().cpu())
+        reader = FileCaptureReader(root)
+        for request, rows in [(71, slice(0, 1)), (72, slice(1, 4))]:
+            sample = reader.read(f"rtp_Cold_{request}")
+            self.assertEqual(sample["metadata"]["capture_layer_ids"], [7, 2])
+            for name, tensor in expected.items():
+                actual = sample["tensors"][name]
+                self.assertEqual(actual.dtype, tensor.dtype)
+                torch.testing.assert_close(actual.view(torch.uint8), tensor[rows].view(torch.uint8), rtol=0, atol=0)
 
 
 class TorchSpecContractGuardTest(unittest.TestCase):
