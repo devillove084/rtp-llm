@@ -1291,7 +1291,12 @@ std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr
     const auto& config = *stream->generateConfig();
     const auto  reject_required = [&](ErrorCode code, const std::string& message) {
         if (config.requiresHiddenStateCaptureAdmission()) {
-            stream->reportError(code, message);
+            if (code == ErrorCode::EXECUTION_EXCEPTION && *model_config_.hidden_state_capture_storage.resolvedStorageDir()) {
+                RTP_LLM_LOG_WARNING("strict file capture admission failed: %s", message.c_str());
+                stream->reportError(code, "file capture admission failed");
+            } else {
+                stream->reportError(code, message);
+            }
         }
     };
     if (stream->hasError() || (!config.capture_hidden_states && !config.isPrefillOnly())) {
@@ -1340,7 +1345,8 @@ std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr
         } else {
             std::lock_guard<std::mutex> lock(capture_admission_mutex_);
             if (executor_) {
-                auto admission = executor_->tryReserveHiddenStateCapture(request_id, stream->inputLength());
+                auto admission = executor_->tryReserveHiddenStateCapture(
+                    request_id, stream->inputLength(), config.requiresHiddenStateCaptureAdmission());
                 if (!admission.ok()) {
                     reject_required(admission.status().code(), admission.status().ToString());
                 } else {

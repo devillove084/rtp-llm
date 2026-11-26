@@ -317,3 +317,39 @@ py_test(
     srcs = ["drain_flag_test.py"],
     deps = ["//rtp_llm:utils"],
 )
+
+py_test(
+    name = "hidden_state_file_store_test",
+    srcs = ["hidden_state_file_store_test.py"],
+    deps = ["//rtp_llm:torch", "//rtp_llm:utils", "//rtp_llm:zstandard"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "GPU_COUNT": "0"},
+)
+
+# Only this cross-implementation check needs the pinned external reference fixture.
+py_test(
+    name = "hidden_state_file_store_archive_check",
+    srcs = ["hidden_state_file_store_archive_check.py", "hidden_state_file_store_test.py"],
+    deps = ["//rtp_llm:torch", "//rtp_llm:utils", "//rtp_llm:zstandard"],
+    env = {"CUDA_VISIBLE_DEVICES": "", "GPU_COUNT": "0"},
+    env_inherit = ["RTP_TEST_TORCHSPEC_ARCHIVE"],
+    tags = ["manual"],
+)
+
+py_test(
+    name = "hidden_state_capture_trace_test",
+    srcs = ["hidden_state_capture_trace_test.py"],
+    args = ["HiddenStateCaptureTraceTest"],
+    data = ["//rtp_llm:utils/hidden_state_capture_trace.py"],
+)
+
+# Opt in with a zip archive of the pinned TorchSpec commit on the test host.
+py_test(
+    name = "hidden_state_capture_trace_mooncake_test",
+    srcs = ["hidden_state_capture_trace_test.py"],
+    main = "hidden_state_capture_trace_test.py",
+    args = ["PinnedMooncakeTraceTest"],
+    deps = ["//rtp_llm:torch", "//rtp_llm:utils"],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+    env_inherit = ["RTP_TEST_TORCHSPEC_ARCHIVE"],
+    tags = ["manual"],
+)

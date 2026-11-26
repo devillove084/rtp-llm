@@ -809,7 +809,8 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
             return absl::InternalError("unexpected model execution");
         }
 
-        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t tokens, bool strict = false) override {
+            strict_calls.push_back(strict);
             reserve_calls.emplace_back(request_id, tokens);
             if (reserve_error) {
                 std::rethrow_exception(reserve_error);
@@ -825,6 +826,7 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
 
         HiddenStateCaptureReservationPtr         next_reservation;
         std::vector<std::pair<int64_t, int64_t>> reserve_calls;
+        std::vector<bool>                        strict_calls;
         std::exception_ptr                     reserve_error;
         Code                                     admission_code = Code::NONE_ERROR;
         int64_t                                  backpressured_request_id = -1;
@@ -926,6 +928,7 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
         recorder->next_reservation = offered;
         recorder->reserve_error    = test_case.reserve_error;
         recorder->admission_code   = test_case.admission_code;
+        recorder->strict_calls.clear();
         recorder->reserve_calls.clear();
         auto query             = std::make_shared<GenerateInput>();
         query->request_id      = request_id++;
@@ -952,6 +955,8 @@ TEST_F(NormalEngineTest, testCaptureAdmissionAndEnqueueCancellationUseRequestAnd
             continue;
         }
         ASSERT_NO_THROW(stream = engine->makeStream(query));
+        EXPECT_EQ(recorder->strict_calls, std::vector<bool>(expected_calls.size(),
+                  test_case.capture_hidden_states && query->generate_config->max_new_tokens == 0));
         ASSERT_NE(stream, nullptr);
         auto* metrics = reporter->getMetricsGroup<RtpLLMHiddenStateCaptureMetrics>();
         const int expected_skip = test_case.global_capture && test_case.capture_hidden_states && test_case.reuse_cache;
@@ -1209,7 +1214,7 @@ TEST_F(NormalEngineTest, testStopJoinsAsyncWorkerWithoutMovingExecutorDestructio
             state_->destructor_entered.set_value(std::this_thread::get_id());
         }
 
-        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t, int64_t) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t, int64_t, bool = false) override {
             auto state = state_;
             if (++state->reserve_calls == 1) {
                 return std::exchange(reservation_, {});
@@ -2746,7 +2751,7 @@ TEST_F(NormalEngineTest, WarmPrefixReuseFollowsGenerationCaptureAdmission) {
     class AdmissionModel: public MockModel {
     public:
         using MockModel::MockModel;
-        MOCK_METHOD(HiddenStateCaptureAdmissionResult, tryReserveHiddenStateCapture, (int64_t, int64_t), (override));
+        MOCK_METHOD(HiddenStateCaptureAdmissionResult, tryReserveHiddenStateCapture, (int64_t, int64_t, bool), (override));
     };
     autil::EnvGuard ignore_switches("RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES", "1");
     CustomConfig config;
@@ -2763,10 +2768,10 @@ TEST_F(NormalEngineTest, WarmPrefixReuseFollowsGenerationCaptureAdmission) {
     } restore_factory;
     NormalExecutor::test_model_factory = [vocab = model_config.vocab_size](const GptModelInitParams&) {
         auto model = std::make_unique<AdmissionModel>(vocab);
-        EXPECT_CALL(*model, tryReserveHiddenStateCapture(3, 7))
+        EXPECT_CALL(*model, tryReserveHiddenStateCapture(3, 7, false))
             .WillOnce(testing::Return(HiddenStateCaptureAdmissionResult{ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE,
                                                                         "quota full"}));
-        EXPECT_CALL(*model, tryReserveHiddenStateCapture(4, 9))
+        EXPECT_CALL(*model, tryReserveHiddenStateCapture(4, 9, false))
             .WillOnce(testing::Return(HiddenStateCaptureAdmissionResult{
                 std::make_shared<HiddenStateCaptureReservation>([]() noexcept {})}));
         return model;

@@ -2857,6 +2857,36 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         finally:
             publisher.close()
 
+    def test_capture_mooncake_multi_key_file_exists_counts_one_duplicate(self):
+        # Select the synchronous Mooncake PUT contract using only a mock send buffer.
+        def setup(store, device):
+            store._gpu_direct_available = True
+            store._gpu_send_buffer = object()
+
+        with patch.object(_FakeEagleMooncakeStore, "setup", setup):
+            publisher = self.capturePublisher()
+        self.addCleanup(publisher.close)
+        store = _FakeEagleMooncakeStore.instances[-1]
+        held = [publisher.reserve(i, 1).reservation for i in (21, 22)]
+        self.assertTrue(all(held))
+        publisher.metrics()
+        def collide(**kwargs):
+            self.assertEqual(list(kwargs["request_ids"]), ["rtp_TestActor_21", "rtp_TestActor_22"])
+            # Also exercise the fatal drain boundary: no real device fence on this CPU-only mock.
+            store.pending_async_errors.append(torch.distributed.DistError("injected drain failure"))
+            raise FileExistsError("source appeared after preflight")
+
+        with patch.object(store, "put_batch", side_effect=collide) as put:
+            self.assertTrue(publisher.submit(torch.zeros((2, 3), dtype=torch.float16), torch.tensor([7, 8]),
+                                             torch.tensor([1, 1], dtype=torch.int32), torch.tensor([21, 22]),
+                                             2, "multi-key Mooncake collision"))
+            self.assertTrue(publisher.drain(5000))
+            put.assert_called_once()
+        metrics, _ = publisher.metrics()
+        self.assertEqual(metrics[_CAPTURE_METRIC_PREFIX + "duplicate_request_id_qps"], 1)
+        self.assertEqual(metrics[_CAPTURE_METRIC_PREFIX + "request_error_failure_qps"], 1)
+        self.assertTrue(publisher.fatal)  # The subsequent drain failure still quarantines the store.
+
     @patch.dict(os.environ, {"MOONCAKE_ASYNC_PUT_POOL_SIZE": "2"})
     def test_capture_raced_foreign_scale_and_marker_survive_drain(self) -> None:
         base = "rtp_TestActor_1"
@@ -3911,8 +3941,9 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
     def test_capture_reservation_generation_and_publisher_lifetime(self) -> None:
         publisher = self.capturePublisher(samples=1, bytes=48, tokens=1)
         try:
-            first = publisher.reserve(7, 1).reservation
+            first = publisher.reserve(7, 1, strict=True).reservation
             self.assertIsNotNone(first)
+            self.assertIsNone(first.publication())  # Strict Mooncake still acknowledges admission, not delivery.
             self.assertTrue(
                 publisher.submit(
                     torch.tensor([[10, 20, 30]], dtype=torch.float16),

@@ -2232,6 +2232,21 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("hidden_size", &ModelConfig::hidden_size)
         .def_readwrite("hidden_state_capture_layer_ids", &ModelConfig::hidden_state_capture_layer_ids)
         .def_readwrite("hidden_state_capture_dtype", &ModelConfig::hidden_state_capture_dtype)
+        .def_property("hidden_state_capture_storage_dir",
+                      [](const ModelConfig& c) { return c.hidden_state_capture_storage.storage_dir; },
+                      [](ModelConfig& c, std::optional<std::string> v) { c.hidden_state_capture_storage.storage_dir = std::move(v); })
+        .def_property("hidden_state_capture_io_workers",
+                      [](const ModelConfig& c) { return c.hidden_state_capture_storage.io_workers; },
+                      [](ModelConfig& c, int64_t v) { c.hidden_state_capture_storage.io_workers = v; })
+        .def_property("hidden_state_capture_io_depth",
+                      [](const ModelConfig& c) { return c.hidden_state_capture_storage.io_depth; },
+                      [](ModelConfig& c, int64_t v) { c.hidden_state_capture_storage.io_depth = v; })
+        .def_property("hidden_state_capture_compression",
+                      [](const ModelConfig& c) { return c.hidden_state_capture_storage.compression; },
+                      [](ModelConfig& c, std::string v) { c.hidden_state_capture_storage.compression = std::move(v); })
+        .def_property("hidden_state_capture_compression_level",
+                      [](const ModelConfig& c) { return c.hidden_state_capture_storage.compression_level; },
+                      [](ModelConfig& c, int64_t v) { c.hidden_state_capture_storage.compression_level = v; })
         .def_readwrite("hidden_state_capture_max_inflight_samples",
                        &ModelConfig::hidden_state_capture_max_inflight_samples)
         .def_readwrite("hidden_state_capture_max_inflight_bytes", &ModelConfig::hidden_state_capture_max_inflight_bytes)

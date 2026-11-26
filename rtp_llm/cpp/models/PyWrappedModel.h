@@ -109,7 +109,7 @@ public:
     std::optional<bool>        reduceSpeculativeTargetPrepareStatus(bool local_ok) override;
     void                       loadMtpIndexerTopk(const torch::Tensor& topk) override;
     torch::Tensor              snapshotMtpIndexerTopk(int64_t batch_size) override;
-    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override;
+    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens, bool strict = false) override;
     ServingDeviceHealthPtr servingDeviceHealth() const override;
 
 private:
@@ -774,7 +774,8 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                      params.hidden_state_capture_max_inflight_tokens,
                                      params.hidden_state_capture_max_pending_batches,
                                      params.hidden_state_capture_poll_interval_ms},
-            params.hidden_state_capture_layer_ids);
+            params.hidden_state_capture_layer_ids,
+            params.hidden_state_capture_storage);
     }
 
     RTP_LLM_LOG_INFO("PyWrappedModel initialized done.");

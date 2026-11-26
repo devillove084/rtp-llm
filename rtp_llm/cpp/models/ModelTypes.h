@@ -13,6 +13,7 @@
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
 #include <array>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -96,6 +97,7 @@ struct GptModelInitParams {
     bool owns_py_model = true;
     // Set uniformly on all ranks constructing the temporary accuracy-check executor.
     bool accuracy_check_mode = false;
+    HiddenStateCaptureStorageConfig hidden_state_capture_storage;
 };
 
 enum GptModelInputIndex : size_t {
@@ -219,12 +221,32 @@ struct HiddenStateCaptureFatalState {
     std::string message;
 };
 
+// This is the entire worker -> RPC contract. Diagnostics (including Python exceptions,
+// storage paths and other requests' keys) must never be carried by a receipt.
+enum class FileCaptureResult { PUBLISHED, FAILED, OWNER_FAILED, QUEUE_FULL, REJECTED, CANCELLED, STOPPED };
+
+inline ErrorInfo fileCaptureStatus(FileCaptureResult result) {
+    switch (result) {
+        case FileCaptureResult::PUBLISHED: return ErrorInfo::OkStatus();
+        case FileCaptureResult::FAILED: return {ErrorCode::EXECUTION_EXCEPTION, "file capture publication failed"};
+        case FileCaptureResult::QUEUE_FULL: return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "file capture queue full"};
+        case FileCaptureResult::REJECTED: return {ErrorCode::EXECUTION_EXCEPTION, "file capture rejected before submit"};
+        case FileCaptureResult::CANCELLED: return {ErrorCode::CANCELLED, "file capture cancelled before submit"};
+        case FileCaptureResult::STOPPED: return {ErrorCode::CANCELLED, "file capture publisher stopped before submit"};
+        case FileCaptureResult::OWNER_FAILED: break;
+    }
+    return {ErrorCode::EXECUTION_EXCEPTION, "file capture publisher failed before confirming publication"};
+}
+
 // Shared by stream copies, but never owns an Executor/model. The cancellation
 // callback must be noexcept and may only release an unsubmitted reservation.
 class HiddenStateCaptureReservation final {
 public:
-    explicit HiddenStateCaptureReservation(std::function<void()> cancel_callback):
-        cancel_callback_(std::move(cancel_callback)) {}
+    explicit HiddenStateCaptureReservation(std::function<void()> cancel_callback,
+                                           std::shared_future<FileCaptureResult> publication = {}):
+        publication_(std::move(publication)), cancel_callback_(std::move(cancel_callback)) {}
+
+    const std::shared_future<FileCaptureResult>& publication() const { return publication_; }
 
     ~HiddenStateCaptureReservation() {
         cancel();
@@ -247,6 +269,7 @@ public:
     }
 
 private:
+    const std::shared_future<FileCaptureResult> publication_;
     mutable std::mutex    mutex_;
     std::function<void()> cancel_callback_;
 };
@@ -268,7 +291,7 @@ public:
     virtual void                       releaseBuffers() {}
     virtual void                       prepareAttentionInputs(const GptModelInputs& inputs) {}
     virtual HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t /*request_id*/,
-                                                                           int64_t /*valid_tokens*/) {
+                                                                           int64_t /*valid_tokens*/, bool /*strict*/ = false) {
         return {ErrorCode::EXECUTION_EXCEPTION, "model does not support hidden-state capture"};
     }
 

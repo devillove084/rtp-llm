@@ -29,6 +29,29 @@ class ModelConfigOverrideTest(unittest.TestCase):
                 self.assertEqual(getattr(self.config, name), default)
                 self.assertIn(f"{name}: {default}\n", self.config.to_string())
 
+    def test_file_options_round_trip_without_enabling_capture(self) -> None:
+        prefix = "hidden_state_capture_"
+        defaults = dict(storage_dir=None, io_workers=2, io_depth=2, compression="none", compression_level=1)
+        for name, value in defaults.items():
+            self.assertEqual(getattr(self.config, prefix + name), value)
+        for directory in ("/mnt/3fs/capture", ""):
+            options = dict(storage_dir=directory, io_workers=1, io_depth=3, compression="zstd", compression_level=-2)
+            self.config.apply_override_args(json.dumps({prefix + k: v for k, v in options.items()}))
+            for name, value in options.items():
+                self.assertEqual(getattr(self.config, prefix + name), value)
+                self.assertIn(f"{prefix}{name}: {value}\n", self.config.to_string())
+            self.assertEqual(self.config.hidden_state_capture_layer_ids, [])
+
+    def test_invalid_file_options_are_atomic(self) -> None:
+        for name, bad in dict(storage_dir=(None, 3, "\0"), io_workers=(True, 0, 2**63),
+                              io_depth=(-1, False), compression=(None, "gzip"),
+                              compression_level=(-131073, 23, True, 1.5)).items():
+            for value in bad:
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    self.config.apply_override_args(json.dumps({"hidden_state_capture_layer_ids": [2],
+                                                                "hidden_state_capture_" + name: value}))
+                self.assertEqual(self.config.hidden_state_capture_layer_ids, [])
+
     def test_capture_limit_overrides_round_trip_and_do_not_enable_capture(self) -> None:
         for name in self.CAPTURE_LIMIT_DEFAULTS:
             for value in (1, 17, 2**63 - 1):

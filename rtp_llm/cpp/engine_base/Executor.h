@@ -24,7 +24,7 @@ public:
     }
     virtual absl::Status process(const ScheduleOutput& schedule_output, int64_t schedule_time_us = 0) = 0;
     virtual HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t /*request_id*/,
-                                                                           int64_t /*valid_tokens*/) {
+                                                                           int64_t /*valid_tokens*/, bool /*strict*/ = false) {
         return {ErrorCode::EXECUTION_EXCEPTION, "executor does not support hidden-state capture"};
     }
 
@@ -45,11 +45,17 @@ protected:
         }
         // Attribute after model/collective work, without changing packed lanes.
         // Explicit capture + zero-token requests require admission and this forward's synchronous capture success.
-        // Publication completion is not guaranteed; consumers must confirm ready.
+        // Strict file publication is checked separately by the RPC consumer.
         for (const auto& stream : streams) {
             if (stream->generateConfig()->requiresHiddenStateCaptureAdmission() && !stream->hasError()) {
                 stream->cancelHiddenStateCapture();
-                stream->reportError(error.code(), error.ToString());
+                if (stream->fileCapturePublication()) {
+                    const auto status = fileCaptureStatus(error.code() == ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE ?
+                                                              FileCaptureResult::QUEUE_FULL : FileCaptureResult::REJECTED);
+                    stream->reportError(status.code(), status.ToString());
+                } else {
+                    stream->reportError(error.code(), error.ToString());
+                }
             }
         }
     }

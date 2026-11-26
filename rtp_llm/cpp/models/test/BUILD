@@ -205,3 +205,19 @@ py_test(
     tags = ["rocm"],
     exec_properties = {"gpu": "MI308X-ROCM7"},
 )
+
+cc_binary(
+    name = "th_hidden_state_file_publisher_cpu_test",
+    deps = [":pywrapped_model_cache_store_integration_test_lib"],
+    linkshared = 1,
+)
+
+# CPU worker regression; the separate file-store archive check owns external reference parity.
+py_test(
+    name = "hidden_state_file_publisher_cpu_test",
+    srcs = ["hidden_state_file_publisher_cpu_test.py"],
+    data = [":th_hidden_state_file_publisher_cpu_test"],
+    deps = ["//rtp_llm:torch", "//rtp_llm:utils", "//rtp_llm:zstandard"],
+    env = {"GPU_COUNT": "0", "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": ""},
+    tags = ["local"],
+)

@@ -322,13 +322,16 @@ public:
         model_id_ = params.model_id;
     }
 
-    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) override {
+    HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens, bool strict = false) override {
+        last_strict_admission = strict;
         capture_reservation_attempts_.emplace_back(request_id, valid_tokens);
         if (!capture_admission_) {
             return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "test capture quota occupied"};
         }
         return std::exchange(capture_admission_, {});
     }
+
+    bool last_strict_admission = false;
 
     void setCaptureAdmission(HiddenStateCaptureReservationPtr reservation) {
         capture_admission_ = std::move(reservation);
@@ -1314,7 +1317,8 @@ public:
 
         const auto request_id = target_only_stream->streamId();
         auto       reservation =
-            components.executor->tryReserveHiddenStateCapture(request_id, target_only_stream->inputLength());
+            components.executor->tryReserveHiddenStateCapture(request_id, target_only_stream->inputLength(), explicit_capture);
+        EXPECT_EQ(target_model->last_strict_admission, explicit_capture);
         ASSERT_EQ(reservation.ok(), !reject_capture_admission);
         ASSERT_EQ(reservation.value(), capture_reservation);
         target_only_stream->setHiddenStateCaptureReservation(std::move(reservation.value()));

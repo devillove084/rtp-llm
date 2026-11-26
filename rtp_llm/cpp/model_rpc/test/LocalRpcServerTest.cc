@@ -10,10 +10,13 @@
 #include <utility>
 #include <vector>
 
+#include <pybind11/embed.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "autil/EnvUtil.h"
 #include "autil/Scope.h"
+#include "rtp_llm/cpp/models/HiddenStateCapturePublisher.h"
 #include "opentelemetry/exporters/memory/in_memory_span_data.h"
 #include "opentelemetry/exporters/memory/in_memory_span_exporter_factory.h"
 #include "opentelemetry/sdk/trace/span_data.h"
@@ -1613,6 +1616,193 @@ TEST(LocalRpcServerTest, PollKeepsTerminalLogitsWhenSelectionCannotMatch) {
         EXPECT_EQ(output.logits().fp32_data(),
                   std::string(static_cast<const char*>(expected_logits.data_ptr()), expected_logits.nbytes()));
     }
+}
+
+TEST(LocalRpcServerTest, StrictFilePublicationGatesTerminalWriteAndObservesCancellationAndDeadline) {
+    enum Outcome { SUCCESS, ENOSPC_ERROR, CANCELED, EXPIRED, ABANDONED };
+    for (auto outcome : {SUCCESS, ENOSPC_ERROR, CANCELED, EXPIRED, ABANDONED}) {
+        SCOPED_TRACE(outcome);
+        TestLocalRpcServer server;
+        RecordingWriter writer;
+        auto stream = createNormalStream();
+        stream->generateConfig()->max_new_tokens = 0;
+        stream->generateConfig()->capture_hidden_states = true;
+        stream->generateConfig()->timeout_ms = outcome == EXPIRED ? 100 : 5000;
+        std::promise<FileCaptureResult> completion;
+        stream->setHiddenStateCaptureReservation(std::make_shared<HiddenStateCaptureReservation>(
+            [] {}, completion.get_future().share()));
+        GenerateOutputs outputs;
+        GenerateOutput row;
+        row.finished = true;
+        row.output_ids = torch::empty({1, 0}, torch::kInt32);
+        outputs.generate_outputs.emplace_back(std::move(row));
+        stream->enqueueGenerateOutput(std::move(outputs));
+        stream->generate_status_->status.store(StreamState::FINISHED);
+        GenerateStreamPtr base = stream;
+        auto entered = server.cancellationChecked();
+        auto rpc = std::async(std::launch::async, [&] { return server.poll(&writer, base); });
+        EXPECT_EQ(entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        if (outcome != EXPIRED) {
+            EXPECT_EQ(rpc.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+        }
+        if (outcome == SUCCESS) { completion.set_value(FileCaptureResult::PUBLISHED); }
+        if (outcome == ENOSPC_ERROR) { completion.set_value(FileCaptureResult::FAILED); }
+        if (outcome == CANCELED) { server.cancelled = true; }
+        if (outcome == ABANDONED) { completion = std::promise<FileCaptureResult>(); }  // Abandoned by a fatal publisher.
+        const auto status = rpc.get();
+        EXPECT_EQ(status.ok(), outcome == SUCCESS);
+        EXPECT_EQ(writer.outputs_.size(), outcome == SUCCESS ? 1u : 0u);
+        if (outcome == ENOSPC_ERROR) {
+            ErrorDetailsPB details;
+            ASSERT_TRUE(details.ParseFromString(status.error_details()));
+            EXPECT_EQ(details.error_code(), static_cast<int>(ErrorCode::EXECUTION_EXCEPTION));
+            EXPECT_EQ(details.error_message(), "file capture publication failed");
+            EXPECT_EQ(status.error_message(), details.error_message());
+        }
+        if (outcome == CANCELED) { EXPECT_EQ(status.error_code(), grpc::StatusCode::CANCELLED); }
+        if (outcome == EXPIRED) { EXPECT_EQ(status.error_code(), grpc::StatusCode::DEADLINE_EXCEEDED); }
+        if (outcome == ABANDONED) { EXPECT_THAT(status.error_message(), HasSubstr("publisher failed")); }
+    }
+}
+
+TEST(LocalRpcServerTest, BatchCollectsSiblingBeforeStrictFileReceiptAndReturnsPerItemError) {
+    for (auto reason : {ErrorCode::EXECUTION_EXCEPTION, ErrorCode::GENERATE_TIMEOUT, ErrorCode::CANCELLED}) {
+        SCOPED_TRACE(static_cast<int>(reason));
+        TestLocalRpcServer server;
+        auto engine = std::make_shared<BatchTraceEngine>();
+        auto first = createMockStream();
+        auto second = createMockStream();
+        first->generateConfig()->max_new_tokens = 0;
+        first->generateConfig()->capture_hidden_states = true;
+        first->generateInput()->request_deadline_ms = currentTimeMs() + 2000;
+        std::promise<FileCaptureResult> completion;
+        first->setHiddenStateCaptureReservation(std::make_shared<HiddenStateCaptureReservation>(
+            [] {}, completion.get_future().share()));
+        EXPECT_CALL(*first, nextOutput(_)).WillOnce(Return(wakeResult(WakeReason::FINISHED)));
+        EXPECT_CALL(*second, nextOutput(_))
+            .WillOnce(Invoke([&](int64_t) {
+                // If the first item's receipt blocked serial output collection this would never run.
+                if (reason == ErrorCode::GENERATE_TIMEOUT) {
+                    first->generateInput()->request_deadline_ms = currentTimeMs() - 1;
+                } else if (reason == ErrorCode::CANCELLED) {
+                    first->reportError(reason, "cancel during publication");
+                } else {
+                    completion.set_value(FileCaptureResult::FAILED);
+                }
+                GenerateOutputs out;
+                out.request_id = 2;
+                auto& row = out.generate_outputs.emplace_back();
+                row.finished = true;
+                row.output_ids = torch::tensor({{7}}, torch::kInt32);
+                return ErrorResult<GenerateOutputs>(std::move(out));
+            }))
+            .WillOnce(Return(wakeResult(WakeReason::FINISHED)));
+        engine->streams = {first, second};
+        server.setEngineForTest(engine);
+        BatchGenerateInputPB request;
+        for (int i = 0; i < 2; ++i) {
+            auto* input = request.add_inputs();
+            input->set_request_id(i + 1);
+            input->add_token_ids(1);
+            input->mutable_generate_config()->set_max_new_tokens(i);
+            input->mutable_generate_config()->set_capture_hidden_states(i == 0);
+        }
+        grpc::ServerContext context;
+        BatchGenerateOutputsPB response;
+        ASSERT_TRUE(server.BatchGenerateCall(&context, &request, &response).ok());
+        ASSERT_EQ(response.results_size(), 2);
+        EXPECT_FALSE(response.results(0).has_final_output());
+        EXPECT_EQ(response.results(0).error_info().error_code(), transErrorCodeToRPC(reason));
+        if (reason == ErrorCode::EXECUTION_EXCEPTION) {
+            EXPECT_EQ(response.results(0).error_info().error_message(), "file capture publication failed");
+        }
+        ASSERT_TRUE(response.results(1).has_final_output());
+        EXPECT_EQ(response.results(1).final_output().request_id(), 2);
+        EXPECT_TRUE(response.results(1).final_output().flatten_output().has_output_ids());
+        EXPECT_FALSE(response.results(1).has_error_info());
+    }
+}
+
+TEST(LocalRpcServerTest, FileWorkerReceiptDoesNotExposeSiblingOrPathInSingleOrBatchRpc) {
+    namespace py = pybind11;
+    autil::EnvGuard local_files("RTP_HIDDEN_STATE_CAPTURE_3FS_LOCAL_PROTOCOL_TEST_ONLY", "1");
+    autil::EnvGuard key_namespace("RTP_HIDDEN_STATE_CAPTURE_KEY_NAMESPACE", "Privacy");
+    py::scoped_interpreter interpreter;
+    py::dict locals;
+    py::exec(R"(
+import sys, tempfile
+from pathlib import Path
+# As in NormalEngineCustomOutputTest, avoid _hashlib binding to the linked 3FS OpenSSL.
+sys.modules['_hashlib'] = None
+import torch
+tmp = tempfile.TemporaryDirectory()
+root = tmp.name
+Path(root, 'rtp_Privacy_42.capture').touch()
+)", locals);
+    const auto root = locals["root"].cast<std::string>();
+    py::gil_scoped_release release;
+    HiddenStateCapturePublisher publisher(2, 1, HiddenStateCaptureDtype::BF16, torch::kFloat16, true, 0,
+                                          nullptr, {}, {0, 1}, HiddenStateCaptureStorageConfig{root});
+    {
+        std::unique_lock<std::mutex> lock(publisher.state_mutex_);
+        ASSERT_TRUE(publisher.state_changed_.wait_for(lock, std::chrono::seconds(10), [&] {
+            return publisher.initialization_complete_ || !publisher.capture_enabled_.load();
+        }));
+    }
+    auto prefix = publisher.tryReserve(41, 1, true);
+    auto failed = publisher.tryReserve(42, 1, true);
+    ASSERT_TRUE(prefix.ok() && failed.ok()) << publisher.diagnostic();
+    bool backpressure;
+    ASSERT_TRUE(publisher.trySubmit(torch::ones({2, 3}, torch::kFloat16), torch::tensor({7, 8}),
+                                    torch::tensor({1, 1}, torch::kInt32), torch::tensor({41, 42}, torch::kInt64),
+                                    2, "RPC disclosure test", backpressure));
+    TestLocalRpcServer server;
+    auto make_terminal = [](const HiddenStateCaptureReservationPtr& ticket) {
+        auto stream = createMockStream();
+        stream->generateConfig()->capture_hidden_states = true;
+        stream->generateConfig()->max_new_tokens = 0;
+        stream->generateInput()->request_deadline_ms = currentTimeMs() + 5000;
+        stream->setHiddenStateCaptureReservation(ticket);
+        EXPECT_CALL(*stream, nextOutput(_)).WillOnce(Return(wakeResult(WakeReason::FINISHED)));
+        return stream;
+    };
+    GenerateStreamPtr single = make_terminal(failed.value());
+    RecordingWriter writer;
+    const auto status = server.poll(&writer, single);
+    ASSERT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+    ErrorDetailsPB details;
+    ASSERT_TRUE(details.ParseFromString(status.error_details()));
+    EXPECT_EQ(details.error_code(), static_cast<int>(ErrorCode::EXECUTION_EXCEPTION));
+    EXPECT_EQ(details.error_message(), "file capture publication failed");
+    EXPECT_EQ(status.error_message(), details.error_message());
+    EXPECT_TRUE(writer.outputs_.empty());
+    EXPECT_THAT(publisher.diagnostic(), HasSubstr("rtp_Privacy_41"));
+    EXPECT_THAT(publisher.diagnostic(), HasSubstr("rtp_Privacy_42"));
+    EXPECT_THAT(publisher.diagnostic(), HasSubstr("hidden_state_file_store.py"));
+
+    auto engine = std::make_shared<BatchTraceEngine>();
+    engine->streams = {make_terminal(prefix.value()), make_terminal(failed.value())};
+    server.setEngineForTest(engine);
+    BatchGenerateInputPB request;
+    for (int id : {41, 42}) {
+        auto* input = request.add_inputs();
+        input->set_request_id(id);
+        input->add_token_ids(1);
+        input->mutable_generate_config()->set_max_new_tokens(0);
+        input->mutable_generate_config()->set_capture_hidden_states(true);
+    }
+    grpc::ServerContext context;
+    BatchGenerateOutputsPB response;
+    ASSERT_TRUE(server.BatchGenerateCall(&context, &request, &response).ok());
+    ASSERT_EQ(response.results_size(), 2);
+    EXPECT_TRUE(response.results(0).has_final_output());
+    EXPECT_FALSE(response.results(0).has_error_info());
+    EXPECT_FALSE(response.results(1).has_final_output());
+    EXPECT_EQ(response.results(1).error_info().error_code(), ErrorCodePB::EXECUTION_EXCEPTION);
+    EXPECT_EQ(response.results(1).error_info().error_message(), "file capture publication failed");
+    py::gil_scoped_acquire gil;
+    EXPECT_GT(py::eval("Path(root, 'rtp_Privacy_41.capture').stat().st_size", locals).cast<int64_t>(), 0);
+    EXPECT_EQ(py::eval("Path(root, 'rtp_Privacy_42.capture').stat().st_size", locals).cast<int64_t>(), 0);
 }
 
 TEST(LocalRpcServerTest, PollWritesFinalLocalOutputBeforeRemoteHandoff) {

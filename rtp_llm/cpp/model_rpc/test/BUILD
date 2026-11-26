@@ -101,8 +101,12 @@ py_test(
 cc_test(
     name = "local_rpc_server_test",
     srcs = ["LocalRpcServerTest.cc"],
+    data = ["//rtp_llm:utils"],
     copts = test_copts,
-    deps = test_deps + ["@io_opentelemetry_cpp//exporters/memory:in_memory_span_exporter"],
+    deps = test_deps + [
+        "@havenask//aios/autil:env_util",
+        "@io_opentelemetry_cpp//exporters/memory:in_memory_span_exporter",
+    ],
     env = {},
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],

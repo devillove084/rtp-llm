@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -16,6 +17,22 @@ namespace rtp_llm {
 enum class HiddenStateCaptureDtype : int32_t {
     BF16     = 0,
     FP8_E4M3 = 1,
+};
+
+// An unset storage directory inherits the legacy environment; an empty one selects Mooncake.
+struct HiddenStateCaptureStorageConfig {
+    const char* resolvedStorageDir() const {
+        if (storage_dir) {
+            return storage_dir->c_str();
+        }
+        const char* env = std::getenv("RTP_HIDDEN_STATE_CAPTURE_3FS_DIR");
+        return env ? env : "";
+    }
+    std::optional<std::string> storage_dir;
+    int64_t io_workers = 2;
+    int64_t io_depth = 2;
+    std::string compression = "none";
+    int64_t compression_level = 1;
 };
 
 /** NCCL communication config (ip + ports). Aligns with Python NcclCommConfig. */

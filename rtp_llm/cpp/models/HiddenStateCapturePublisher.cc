@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <time.h>
+#include <unistd.h>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <optional>
@@ -40,6 +43,18 @@ namespace py = pybind11;
 namespace rtp_llm {
 
 namespace {
+
+const char* envOrEmpty(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? value : "";
+}
+
+// Deferred worker marks must share Python time.monotonic_ns()'s clock domain.
+int64_t traceTimeNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
+}
 
 #if USING_CUDA
 constexpr auto kCaptureRuntimeDomain = DeviceRuntimeDomain::CUDA;
@@ -294,9 +309,12 @@ struct HiddenStateCapturePublisher::PublishTask {
     bool                          local_fenced{false};
     bool                          succeeded{false};
     bool                          dropped{false};
+    bool                          has_receipts{false};
+    size_t                        committed_prefix{0};
     bool                          cleanup_started{false};
     std::chrono::steady_clock::time_point completion_retry_after{};
     int64_t                       quota_bytes{0};
+    int64_t                       submit_ns{0}, submit_tid{0}, dequeue_ns{0}, producer_ready_ns{0};
 };
 
 template<typename Operation>
@@ -331,7 +349,8 @@ HiddenStateCapturePublisher::HiddenStateCapturePublisher(int64_t                
                                                          int                          local_rank,
                                                          kmonitor::MetricsReporterPtr metrics_reporter,
                                                          HiddenStateCaptureLimits     limits,
-                                                         std::vector<int64_t>         layer_ids):
+                                                         std::vector<int64_t>         layer_ids,
+                                                         HiddenStateCaptureStorageConfig storage):
     layer_count_(layer_count),
     layer_ids_(std::move(layer_ids)),
     hidden_size_(hidden_size),
@@ -340,6 +359,9 @@ HiddenStateCapturePublisher::HiddenStateCapturePublisher(int64_t                
     capture_dtype_(capture_dtype),
     model_dtype_(model_dtype),
     owner_(owner),
+    storage_(std::move(storage)),
+    file_store_dir_(storage_.resolvedStorageDir()),
+    trace_enabled_(*envOrEmpty("RTP_HIDDEN_STATE_CAPTURE_TRACE_DIR") != 0),
     metrics_reporter_(owner ? std::move(metrics_reporter) : nullptr) {
     capture_enabled_metric_ = registerKmonStatusMetric(metrics_reporter_, "rtp_llm_hidden_state_capture_enabled");
     capture_broken_metric_  = registerKmonStatusMetric(metrics_reporter_, "rtp_llm_hidden_state_capture_broken");
@@ -354,6 +376,13 @@ HiddenStateCapturePublisher::HiddenStateCapturePublisher(int64_t                
                         FailureStage::INITIALIZATION,
                         FailureDisposition::HARD_CONTRACT,
                         "publisher configuration");
+        return;
+    }
+    if (file_store_dir_.find('\0') != std::string::npos || storage_.io_workers <= 0 || storage_.io_depth <= 0
+        || (storage_.compression != "none" && storage_.compression != "zstd")
+        || storage_.compression_level < -131072 || storage_.compression_level > 22) {
+        completeFailure("invalid hidden-state capture storage configuration", FailureStage::INITIALIZATION,
+                        FailureDisposition::HARD_CONTRACT, "publisher configuration");
         return;
     }
     if (!owner_ || !capture_enabled_.load(std::memory_order_acquire)) {
@@ -392,8 +421,9 @@ HiddenStateCapturePublisher::~HiddenStateCapturePublisher() {
     flushAndClose();
     // If shutdown was entered without a live interpreter, intentionally leak the
     // Python handles rather than calling into a finalized interpreter.
-    (void)mooncake_config_.release();
+    (void)key_provider_.release();
     (void)store_.release();
+    (void)trace_mark_.release();
     (void)quantize_fn_.release();
     (void)host_buffer_too_small_type_.release();
 }
@@ -476,7 +506,7 @@ bool HiddenStateCapturePublisher::retainedBytes(const PublishTask& task, int64_t
     return true;
 }
 
-HiddenStateCaptureAdmissionResult HiddenStateCapturePublisher::tryReserve(int64_t request_id, int64_t valid_tokens) {
+HiddenStateCaptureAdmissionResult HiddenStateCapturePublisher::tryReserve(int64_t request_id, int64_t valid_tokens, bool strict) {
     if (!owner_) {
         return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture publisher is not the owner"};
     }
@@ -523,6 +553,7 @@ HiddenStateCaptureAdmissionResult HiddenStateCapturePublisher::tryReserve(int64_
                 return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "hidden-state capture quota is temporarily occupied"};
             }
             const auto generation = ++reservation_generation_;
+            auto receipt = strict && !file_store_dir_.empty() ? std::make_unique<std::promise<FileCaptureResult>>() : nullptr;
             reservation           = std::make_shared<HiddenStateCaptureReservation>(
                 [lifetime = reservation_lifetime_, request_id, generation]() noexcept {
                     try {
@@ -535,8 +566,8 @@ HiddenStateCaptureAdmissionResult HiddenStateCapturePublisher::tryReserve(int64_
                     } catch (...) {
                         RTP_LLM_LOG_WARNING("hidden-state capture reservation cancellation failed with unknown exception");
                     }
-                });
-            reservations_.emplace(request_id, Reservation{generation, valid_tokens, bytes, false, nullptr, {}, {}, nullptr});
+                }, receipt ? receipt->get_future().share() : std::shared_future<FileCaptureResult>{});
+            reservations_.emplace(request_id, Reservation{generation, valid_tokens, bytes, false, nullptr, {}, {}, nullptr, std::move(receipt)});
             reserved_bytes_ += bytes;
             reserved_tokens_ += valid_tokens;
             return std::move(reservation);
@@ -566,20 +597,22 @@ int64_t HiddenStateCapturePublisher::inflightBytes() const {
 }
 
 void HiddenStateCapturePublisher::discardReserved(int64_t request_id) {
-    cancelReserved(request_id, std::nullopt);
+    cancelReserved(request_id, std::nullopt, FileCaptureResult::REJECTED);
 }
 
-void HiddenStateCapturePublisher::cancelReserved(int64_t request_id, std::optional<uint64_t> generation) {
+void HiddenStateCapturePublisher::cancelReserved(int64_t request_id, std::optional<uint64_t> generation, FileCaptureResult outcome) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto                        entry = reservations_.find(request_id);
     if (entry == reservations_.end() || entry->second.submitted
         || (generation && entry->second.generation != *generation)) {
         return;
     }
-    reserved_bytes_ -= entry->second.bytes;
-    reserved_tokens_ -= entry->second.tokens;
-    reservations_.erase(entry);
+    auto receipt = std::move(entry->second.receipt);
+    releaseReservation(entry);
     state_changed_.notify_all();
+    if (receipt) {
+        receipt->set_value(outcome);
+    }
 }
 
 bool HiddenStateCapturePublisher::shouldPublish() {
@@ -596,7 +629,10 @@ int64_t HiddenStateCapturePublisher::packedWidth() const {
 }
 
 std::string HiddenStateCapturePublisher::makeRequestKey(int64_t request_id) const {
-    return mooncake_config_.attr("make_store_key")(request_id).cast<std::string>();
+    if (!file_store_dir_.empty()) {
+        return key_provider_.attr("make_store_key")(store_key_namespace_, request_id).cast<std::string>();
+    }
+    return key_provider_.attr("make_store_key")(request_id).cast<std::string>();
 }
 
 std::string HiddenStateCapturePublisher::makeBatchId(uint64_t batch_sequence,
@@ -663,6 +699,11 @@ void HiddenStateCapturePublisher::latchFatal(const char* error_message) noexcept
     // original failure is an allocator failure. Diagnostics are best-effort.
     capture_enabled_.store(false, std::memory_order_release);
     fatal_failed_.store(true, std::memory_order_release);
+    if (!file_store_dir_.empty()) {
+        // Wake waiters even for payloads retained in fatal quarantine. No fence/ownership changes.
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        abandonFileReceiptsLocked();
+    }
     if (!error_message) {
         return;  // Latch before formatting; the first diagnostic is filled in afterwards.
     }
@@ -794,6 +835,9 @@ bool HiddenStateCapturePublisher::observeAsyncErrors(FailureStage failure_stage,
     if (fatal_failed_.load(std::memory_order_acquire)) {
         return false;
     }
+    if (!file_store_dir_.empty()) {
+        return true;  // File PUTs are synchronous and have no async error FIFO.
+    }
     RTP_LLM_PROFILE_SCOPE("hidden_state_capture.observe_async_errors");
     bool       success = true;
     py::object result;
@@ -920,6 +964,130 @@ bool HiddenStateCapturePublisher::completeFailure(const std::string& error_messa
     return false;
 }
 
+void HiddenStateCapturePublisher::markTrace(const char* name, const py::list& keys, int64_t ts_ns, int64_t origin_tid) const {
+    // Called only on the worker under the publication GIL, never inside the queue mutex.
+    if (trace_mark_) {
+        try {
+            trace_mark_(name, keys, py::arg("ts_ns") = ts_ns,
+                        py::arg("origin_tid") = origin_tid ? py::cast(origin_tid) : py::none());
+        } catch (const py::error_already_set& error) {
+            RTP_LLM_INTERVAL_LOG(300, WARN, "capture timeline mark failed: %s", error.what());
+        }
+    }
+}
+
+void HiddenStateCapturePublisher::initializeStore(int local_rank) {
+    if (!file_store_dir_.empty()) {
+        // The file protocol uses an ASCII alphanumeric namespace and nonnegative int64 IDs.
+        // Only an unset capture-specific override inherits the legacy namespace.
+        const char* ns = std::getenv("RTP_HIDDEN_STATE_CAPTURE_KEY_NAMESPACE");
+        store_key_namespace_ = ns ? ns : envOrEmpty("MOONCAKE_STORE_KEY_NAMESPACE");
+        key_provider_ = perform(FailureStage::INITIALIZATION, FailureDisposition::OPERATIONAL,
+                                "failed to import the file capture contract",
+                                [] { return py::module_::import("rtp_llm.utils.hidden_state_file_contract"); });
+        perform(FailureStage::INITIALIZATION, FailureDisposition::HARD_CONTRACT,
+                "invalid file capture key namespace", [&] { (void)makeRequestKey(0); });
+        store_ = perform(FailureStage::INITIALIZATION, FailureDisposition::OPERATIONAL,
+                         "failed to initialize FileCaptureStore", [&] {
+            return py::module_::import("rtp_llm.utils.hidden_state_file_store").attr("FileCaptureStore")(
+                file_store_dir_, py::arg("io_workers") = storage_.io_workers, py::arg("io_depth") = storage_.io_depth,
+                py::arg("compression") = storage_.compression, py::arg("compression_level") = storage_.compression_level);
+        });
+        perform(FailureStage::INITIALIZATION, FailureDisposition::HARD_CONTRACT, "invalid file store", [&] {
+            if (!PyCallable_Check(optionalAttribute(store_, "put_batch").ptr())) {
+                throw std::runtime_error("FileCaptureStore.put_batch must be callable");
+            }
+        });
+        // Keep put_batch_capacity_ at zero: the file store pipelines the whole batch at its own depth.
+        return;
+    }
+
+    auto mooncake_module = perform(FailureStage::INITIALIZATION, FailureDisposition::OPERATIONAL,
+                                   "failed to import torchspec.transfer.mooncake",
+                                   [] { return py::module_::import("torchspec.transfer.mooncake"); });
+    key_provider_ = perform(FailureStage::INITIALIZATION, FailureDisposition::OPERATIONAL,
+                               "MooncakeConfig.from_env failed",
+                               [&] { return mooncake_module.attr("MooncakeConfig").attr("from_env")(); });
+    store_key_namespace_ =
+        perform(FailureStage::INITIALIZATION,
+                FailureDisposition::HARD_CONTRACT,
+                "invalid Mooncake store-key namespace contract",
+                [&]() {
+                    const auto make_key = optionalAttribute(key_provider_, "make_store_key");
+                    if (!PyCallable_Check(make_key.ptr())) {
+                        throw std::runtime_error("MooncakeConfig.make_store_key must be callable");
+                    }
+                    (void)make_key(0).cast<std::string>();
+                    return key_provider_.attr("store_key_namespace").cast<std::string>();
+                });
+
+    perform(FailureStage::INITIALIZATION,
+            FailureDisposition::HARD_CONTRACT,
+            "invalid Mooncake capture layout contract",
+            [&]() {
+                const auto configured_hidden_dim = key_provider_.attr("hidden_dim").cast<int64_t>();
+                if (configured_hidden_dim != hidden_size_) {
+                    throw std::runtime_error("Mooncake hidden_dim " + std::to_string(configured_hidden_dim)
+                                             + " does not match RTP hidden size " + std::to_string(hidden_size_));
+                }
+                const auto configured_layer_count = key_provider_.attr("num_aux_layers").cast<int64_t>();
+                if (configured_layer_count != layer_count_) {
+                    throw std::runtime_error("Mooncake num_aux_layers " + std::to_string(configured_layer_count)
+                                             + " does not match RTP capture layer count "
+                                             + std::to_string(layer_count_));
+                }
+            });
+
+    store_ = perform(FailureStage::INITIALIZATION,
+                     FailureDisposition::OPERATIONAL,
+                     "failed to construct EagleMooncakeStore",
+                     [&]() { return mooncake_module.attr("EagleMooncakeStore")(key_provider_); });
+    perform(FailureStage::INITIALIZATION,
+            FailureDisposition::HARD_CONTRACT,
+            "EagleMooncakeStore does not satisfy the RTP batch publisher contract",
+            [&]() {
+                for (const char* method_name :
+                     {"put_batch", "query_keys", "reclaim_abandoned_capture", "take_async_errors", "flush", "close"}) {
+                    if (!PyCallable_Check(optionalAttribute(store_, method_name).ptr())) {
+                        throw std::runtime_error(std::string("EagleMooncakeStore.") + method_name
+                                                 + " must be callable");
+                    }
+                }
+            });
+    perform(FailureStage::INITIALIZATION,
+            FailureDisposition::OPERATIONAL,
+            "failed to set up EagleMooncakeStore",
+            [&]() {
+                py::object torch_module = py::module_::import("torch");
+                py::object device       = torch_module.attr("device")("cuda:" + std::to_string(local_rank));
+                store_.attr("setup")(device);
+                store_.attr("warmup_rdma")();
+            });
+    perform(FailureStage::INITIALIZATION,
+            FailureDisposition::HARD_CONTRACT,
+            "invalid Mooncake batch PUT capacity",
+            [&]() {
+                // Match Eagle's actual send branch when known. Stores without
+                // private backend details conservatively use configured capacity.
+                const auto gpu_direct = optionalAttribute(store_, "_gpu_direct_available");
+                const bool gpu_send_available = !gpu_direct.is_none() && gpu_direct.cast<bool>()
+                                                && !optionalAttribute(store_, "_gpu_send_buffer").is_none();
+                if (!gpu_send_available) {
+                    const auto pool_size = optionalAttribute(key_provider_, "async_put_pool_size");
+                    put_batch_capacity_  = pool_size.is_none() ? 1 : pool_size.cast<int64_t>();
+                    if (put_batch_capacity_ <= 0) {
+                        throw std::runtime_error("Mooncake host PUT is disabled (async_put_pool_size <= 0) "
+                                                 "and no GPU Direct send buffer is available");
+                    }
+                    auto type = optionalAttribute(mooncake_module, "CaptureHostBufferTooSmall");
+                    if (PyExceptionClass_Check(type.ptr()) && type.ptr() != PyExc_ValueError
+                        && PyErr_GivenExceptionMatches(type.ptr(), PyExc_ValueError)) {
+                        host_buffer_too_small_type_ = std::move(type);
+                    }
+                }
+            });
+}
+
 void HiddenStateCapturePublisher::initialize(int local_rank) {
     if (!owner_) {
         return;
@@ -927,100 +1095,31 @@ void HiddenStateCapturePublisher::initialize(int local_rank) {
 
     py::gil_scoped_acquire initialization_gil;
     try {
-        py::object             mooncake_module = perform(FailureStage::INITIALIZATION,
-                                             FailureDisposition::OPERATIONAL,
-                                             "failed to import torchspec.transfer.mooncake",
-                                             []() { return py::module_::import("torchspec.transfer.mooncake"); });
-        mooncake_config_                       = perform(FailureStage::INITIALIZATION,
-                                   FailureDisposition::OPERATIONAL,
-                                   "MooncakeConfig.from_env failed",
-                                   [&]() { return mooncake_module.attr("MooncakeConfig").attr("from_env")(); });
-        store_key_namespace_ =
-            perform(FailureStage::INITIALIZATION,
-                    FailureDisposition::HARD_CONTRACT,
-                    "invalid Mooncake store-key namespace contract",
-                    [&]() {
-                        const auto make_key = optionalAttribute(mooncake_config_, "make_store_key");
-                        if (!PyCallable_Check(make_key.ptr())) {
-                            throw std::runtime_error("MooncakeConfig.make_store_key must be callable");
-                        }
-                        (void)make_key(0).cast<std::string>();
-                        return mooncake_config_.attr("store_key_namespace").cast<std::string>();
-                    });
-
-        perform(FailureStage::INITIALIZATION,
-                FailureDisposition::HARD_CONTRACT,
-                "invalid Mooncake capture layout contract",
-                [&]() {
-                    const auto configured_hidden_dim = mooncake_config_.attr("hidden_dim").cast<int64_t>();
-                    if (configured_hidden_dim != hidden_size_) {
-                        throw std::runtime_error("Mooncake hidden_dim " + std::to_string(configured_hidden_dim)
-                                                 + " does not match RTP hidden size " + std::to_string(hidden_size_));
-                    }
-                    const auto configured_layer_count = mooncake_config_.attr("num_aux_layers").cast<int64_t>();
-                    if (configured_layer_count != layer_count_) {
-                        throw std::runtime_error("Mooncake num_aux_layers " + std::to_string(configured_layer_count)
-                                                 + " does not match RTP capture layer count "
-                                                 + std::to_string(layer_count_));
-                    }
-                });
-
-        store_ = perform(FailureStage::INITIALIZATION,
-                         FailureDisposition::OPERATIONAL,
-                         "failed to construct EagleMooncakeStore",
-                         [&]() { return mooncake_module.attr("EagleMooncakeStore")(mooncake_config_); });
-        perform(FailureStage::INITIALIZATION,
-                FailureDisposition::HARD_CONTRACT,
-                "EagleMooncakeStore does not satisfy the RTP batch publisher contract",
-                [&]() {
-                    for (const char* method_name :
-                         {"put_batch", "query_keys", "reclaim_abandoned_capture", "take_async_errors", "flush", "close"}) {
-                        if (!PyCallable_Check(optionalAttribute(store_, method_name).ptr())) {
-                            throw std::runtime_error(std::string("EagleMooncakeStore.") + method_name
-                                                     + " must be callable");
-                        }
-                    }
-                });
-        perform(FailureStage::INITIALIZATION,
-                FailureDisposition::OPERATIONAL,
-                "failed to set up EagleMooncakeStore",
-                [&]() {
-                    py::object torch_module = py::module_::import("torch");
-                    py::object device       = torch_module.attr("device")("cuda:" + std::to_string(local_rank));
-                    store_.attr("setup")(device);
-                    store_.attr("warmup_rdma")();
-                });
-        perform(FailureStage::INITIALIZATION,
-                FailureDisposition::HARD_CONTRACT,
-                "invalid Mooncake batch PUT capacity",
-                [&]() {
-                    // Match Eagle's actual send branch when known. Stores without
-                    // private backend details conservatively use configured capacity.
-                    const auto gpu_direct = optionalAttribute(store_, "_gpu_direct_available");
-                    const bool gpu_send_available = !gpu_direct.is_none() && gpu_direct.cast<bool>()
-                                                    && !optionalAttribute(store_, "_gpu_send_buffer").is_none();
-                    if (!gpu_send_available) {
-                        const auto pool_size = optionalAttribute(mooncake_config_, "async_put_pool_size");
-                        put_batch_capacity_  = pool_size.is_none() ? 1 : pool_size.cast<int64_t>();
-                        if (put_batch_capacity_ <= 0) {
-                            throw std::runtime_error("Mooncake host PUT is disabled (async_put_pool_size <= 0) "
-                                                     "and no GPU Direct send buffer is available");
-                        }
-                        auto type = optionalAttribute(mooncake_module, "CaptureHostBufferTooSmall");
-                        if (PyExceptionClass_Check(type.ptr()) && type.ptr() != PyExc_ValueError
-                            && PyErr_GivenExceptionMatches(type.ptr(), PyExc_ValueError)) {
-                            host_buffer_too_small_type_ = std::move(type);
-                        }
-                    }
-                });
-        if (capture_dtype_ == HiddenStateCaptureDtype::FP8_E4M3) {
-            quantize_fn_ =
-                perform(FailureStage::INITIALIZATION,
-                        FailureDisposition::OPERATIONAL,
-                        "failed to load TorchSpec FP8 quantizer",
-                        []() { return py::module_::import("torchspec.utils.fp8").attr("quantize_aux_hidden_states"); });
+        initializeStore(local_rank);
+        if (trace_enabled_) {
+            try {
+                auto trace = py::module_::import("rtp_llm.utils.hidden_state_capture_trace");
+                trace.attr("start")();
+                trace_mark_ = trace.attr("mark");
+                if (file_store_dir_.empty()) {
+                    trace.attr("instrument_mooncake_store")(store_);
+                }
+            } catch (const py::error_already_set& error) {
+                RTP_LLM_LOG_WARNING("capture timeline setup failed: %s", error.what());
+            }
         }
-        RTP_LLM_LOG_INFO("TorchSpec hidden-state publisher initialized on local rank %d", local_rank);
+        if (capture_dtype_ == HiddenStateCaptureDtype::FP8_E4M3) {
+            quantize_fn_ = perform(FailureStage::INITIALIZATION, FailureDisposition::OPERATIONAL,
+                                   file_store_dir_.empty() ? "failed to load TorchSpec FP8 quantizer" :
+                                                             "failed to load file capture FP8 quantizer",
+                                   [&]() -> py::object {
+                                       return file_store_dir_.empty() ?
+                                           py::module_::import("torchspec.utils.fp8").attr("quantize_aux_hidden_states") :
+                                           key_provider_.attr("quantize_aux_hidden_states");
+                                   });
+        }
+        RTP_LLM_LOG_INFO("TorchSpec hidden-state publisher initialized on local rank %d (%s)",
+                         local_rank, file_store_dir_.empty() ? "Mooncake" : "3FS");
         recordCaptureStatus();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1034,15 +1133,15 @@ void HiddenStateCapturePublisher::initialize(int local_rank) {
             return;
         }
         const std::string error_message =
-            std::string("failed to initialize TorchSpec hidden-state publisher; install the TorchSpec runtime "
-                        "providing torchspec.transfer.mooncake (and torchspec.utils.fp8 for FP8 capture) in the "
-                        "same Python environment: ")
+            std::string(file_store_dir_.empty() ? "failed to initialize TorchSpec hidden-state publisher; install the TorchSpec runtime "
+                                                  "providing torchspec.transfer.mooncake (and torchspec.utils.fp8 for FP8 capture) in the "
+                                                  "same Python environment: " : "failed to initialize 3FS hidden-state publisher: ")
             + failure.what();
         // setup() or warmup_rdma() may fail after store_ is assigned. Drop
         // partially initialized Python objects here so shutdown cannot retry
         // initialization while attempting to flush them.
         py::gil_scoped_acquire gil;
-        if (store_ && !store_.is_none()) {
+        if (file_store_dir_.empty() && store_ && !store_.is_none()) {
             try {
                 store_.attr("close")();
             } catch (const py::error_already_set& close_error) {
@@ -1064,7 +1163,8 @@ void HiddenStateCapturePublisher::initialize(int local_rank) {
                                   close_error.what());
             }
         }
-        mooncake_config_ = py::object();
+        trace_mark_      = py::object();
+        key_provider_ = py::object();
         store_           = py::object();
         quantize_fn_     = py::object();
         host_buffer_too_small_type_ = py::object();
@@ -1106,9 +1206,8 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
             if (metrics.has_store_put_latency && !store_put_latency_completed) {
                 metrics.store_put_latency_us += autil::TimeUtility::currentTimeInMicroSeconds() - store_put_start_us;
             }
-            // Capture diagnostics/health are owner-local. Neither recoverable
-            // failures nor async worker fatals are attributed to serving batches.
             const auto completion_detail =
+                task.store_attempted && !file_store_dir_.empty() ? " (file publication is per key; a failed batch may have committed other keys)" :
                 task.store_attempted ? " (prefix with no flush error observed: " + std::to_string(flushed_request_count) + "/"
                                            + std::to_string(metrics.request_count) + " requests, "
                                            + std::to_string(flushed_token_count) + "/" + std::to_string(metrics.token_count)
@@ -1270,10 +1369,10 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                         // the GIL before perform() inspects them.
                         py::gil_scoped_release release;
                         stored_auxiliary = stored_auxiliary.contiguous();
-                        stored_input_ids =
-                            task.input_ids
-                                .to(torch::TensorOptions().device(last_hidden_states.device()).dtype(torch::kInt64))
-                                .contiguous();
+                        // File writers consume CPU ids directly; device ids stay on their original device
+                        // for the store to stage on the worker stream. Mooncake still expects device ids.
+                        const auto ids_device = file_store_dir_.empty() ? last_hidden_states.device() : task.input_ids.device();
+                        stored_input_ids = task.input_ids.to(torch::TensorOptions().device(ids_device).dtype(torch::kInt64)).contiguous();
                         if (hidden_states_scale.defined()) {
                             hidden_states_scale = hidden_states_scale.contiguous();
                         }
@@ -1315,26 +1414,36 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
             for (const auto id : task.ids) {
                 auto key = makeRequestKey(id);
                 base_keys.append(key);
-                // EagleMooncakeStore.TENSOR_SUFFIXES, including payloads not produced by this layout.
-                std::vector<std::string> keys{key + "_hs", key + "_hss", key + "_tgt", key + "_ids", key + "_lhs", key + "_ready"};
-                source_keys.insert(source_keys.end(), keys.begin(), keys.end());
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                auto& reservation = reservations_.at(id);
-                reservation.base_key = std::move(key);
-                reservation.keys = std::move(keys);
+                if (file_store_dir_.empty()) {
+                    // EagleMooncakeStore.TENSOR_SUFFIXES, including payloads not produced by this layout.
+                    std::vector<std::string> keys{key + "_hs", key + "_hss", key + "_tgt", key + "_ids", key + "_lhs", key + "_ready"};
+                    source_keys.insert(source_keys.end(), keys.begin(), keys.end());
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    auto& reservation = reservations_.at(id);
+                    reservation.base_key = std::move(key);
+                    reservation.keys = std::move(keys);
+                }
             }
-            if (fatal_failed_.load(std::memory_order_acquire)) {
-                return;
+            if (trace_mark_) {
+                markTrace("publisher.submit", base_keys, task.submit_ns, task.submit_tid);
+                markTrace("publisher.dequeue", base_keys, task.dequeue_ns);
+                markTrace("publisher.producer_ready", base_keys, task.producer_ready_ns);
             }
-            const auto existing = perform(FailureStage::STORE,
-                                          FailureDisposition::OPERATIONAL,
-                                          "source-key preflight query failed",
-                                          [&]() { return querySourceKeys(source_keys); });
-            for (const auto& key : source_keys) {
-                if (existing[py::str(key)].cast<bool>()) {
-                    throw CaptureFailure(FailureStage::STORE,
-                                         FailureDisposition::REQUEST_ERROR,
-                                         "capture source key already exists; refusing to overwrite it: " + key);
+            // FileCaptureStore atomically refuses replacement; no remote ownership ledger is needed.
+            if (file_store_dir_.empty()) {
+                if (fatal_failed_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                const auto existing = perform(FailureStage::STORE,
+                                              FailureDisposition::OPERATIONAL,
+                                              "source-key preflight query failed",
+                                              [&]() { return querySourceKeys(source_keys); });
+                for (const auto& key : source_keys) {
+                    if (existing[py::str(key)].cast<bool>()) {
+                        throw CaptureFailure(FailureStage::STORE,
+                                             FailureDisposition::REQUEST_ERROR,
+                                             "capture source key already exists; refusing to overwrite it: " + key);
+                    }
                 }
             }
             py::list capture_layer_ids;
@@ -1393,8 +1502,8 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                 // exactly this chunk before entering the store, not its suffix.
                 const bool previous_store_attempted = task.store_attempted;
                 const bool previous_store_flushed   = task.store_flushed;
-                const auto attempt = std::make_shared<PutAttempt>();
-                {
+                if (file_store_dir_.empty()) {
+                    const auto attempt = std::make_shared<PutAttempt>();
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     for (int64_t i = chunk_begin; i < chunk_begin + chunk_count; ++i) {
                         reservations_.at(task.ids[i]).put_attempted = attempt;
@@ -1446,16 +1555,90 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                     if (!batch_stage) {
                         latchFatal(nullptr);
                     }
-                    const auto failure = CaptureFailure::fromPython(*this, FailureStage::STORE,
-                        batch_stage ? FailureDisposition::OPERATIONAL : FailureDisposition::FATAL, e, batch_stage.has_value());
-                    if (failure.failureDisposition() == FailureDisposition::FATAL) {
-                        throw failure;
+                    // FileCaptureStore joins its prepare tasks and reports ordered commit receipts.
+                    // Classify the original exception, not the wrapper (typed device errors can
+                    // have an innocuous message). Never attribute the failed key to the prefix.
+                    auto detail = e.value();
+                    std::string batch_detail;
+                    std::string failed_key;
+                    if (!file_store_dir_.empty() && chunk_count > 1
+                        && py::isinstance(detail, py::module_::import("rtp_llm.utils.hidden_state_file_store").attr("CaptureBatchError"))) {
+                        failed_key = detail.attr("failed_key").cast<std::string>();
+                        if (task.has_receipts) {
+                            const auto keys = detail.attr("committed_keys").cast<py::tuple>();
+                            size_t n = keys.size();
+                            if (n < chunk_count && failed_key == batch_keys[n].cast<std::string>()) {
+                                size_t i = 0;
+                                while (i < n && py::object(keys[i]).equal(py::object(batch_keys[i]))) { ++i; }
+                                if (i == n) { task.committed_prefix = chunk_begin + n; }
+                            }
+                        }
+                        batch_detail = "committed_keys=" + py::repr(detail.attr("committed_keys")).cast<std::string>()
+                                       + "; first uncommitted key=" + failed_key + "; ";
+                        auto cause = py::reinterpret_steal<py::object>(PyException_GetCause(detail.ptr()));
+                        if (cause) {
+                            detail = std::move(cause);
+                        }
                     }
-                    const auto python_error = std::string(failure.what());
-                    // FileExistsError alone is not a chunk-scoped no-write certificate.
-                    if (e.matches(PyExc_FileExistsError)) {
-                        const auto first_key = batch_keys[0].cast<std::string>();
-                        recordDuplicateRequestId(chunk_first_id, first_key, "Mooncake batch admission");
+                    if (!file_store_dir_.empty()) {
+                        // Joined preparation futures are independent exceptions on Python 3.10.
+                        // Inspect them (and both chaining edges) before classifying the primary I/O error.
+                        std::vector<py::object> pending{e.value()};
+                        std::unordered_set<PyObject*> seen;
+                        while (!pending.empty()) {
+                            auto error = std::move(pending.back());
+                            pending.pop_back();
+                            if (!seen.insert(error.ptr()).second) {
+                                continue;
+                            }
+                            if (!PyExceptionInstance_Check(error.ptr())) {
+                                throw CaptureFailure(FailureStage::STORE, FailureDisposition::FATAL,
+                                                     "invalid file store additional_errors entry", true);
+                            }
+                            if (error.ptr() != e.value().ptr() && error.ptr() != detail.ptr()) {
+                                const auto nested = CaptureFailure::fromPython(*this, FailureStage::STORE,
+                                    FailureDisposition::OPERATIONAL, error, nullptr, true);
+                                if (nested.failureDisposition() == FailureDisposition::FATAL) {
+                                    throw CaptureFailure(FailureStage::STORE, FailureDisposition::FATAL,
+                                                         batch_detail + nested.what(), true);
+                                }
+                            }
+                            for (auto next : {PyException_GetCause, PyException_GetContext}) {
+                                if (auto child = py::reinterpret_steal<py::object>(next(error.ptr()))) {
+                                    pending.push_back(std::move(child));
+                                }
+                            }
+                            auto additional = optionalAttribute(error, "additional_errors");
+                            if (!additional.is_none()) {
+                                if (!py::isinstance<py::tuple>(additional)) {
+                                    throw CaptureFailure(FailureStage::STORE, FailureDisposition::FATAL,
+                                                         "invalid file store additional_errors tuple", true);
+                                }
+                                for (auto child : additional) {
+                                    pending.push_back(py::reinterpret_borrow<py::object>(child));
+                                }
+                            }
+                        }
+                    }
+                    const auto failure = CaptureFailure::fromPython(*this, FailureStage::STORE,
+                        batch_stage ? FailureDisposition::OPERATIONAL : FailureDisposition::FATAL, detail, &e,
+                        batch_stage.has_value());
+                    const auto python_error = batch_detail + failure.what();
+                    if (failure.failureDisposition() == FailureDisposition::FATAL) {
+                        throw CaptureFailure(FailureStage::STORE, FailureDisposition::FATAL, python_error, true);
+                    }
+                    if (py::isinstance(detail, py::handle(PyExc_FileExistsError))) {
+                        if (file_store_dir_.empty()) {
+                            recordDuplicateRequestId(chunk_first_id, batch_keys[0].cast<std::string>(), "Mooncake batch admission");
+                        } else {
+                            for (int64_t i = 0; i < chunk_count; ++i) {
+                                const auto key = batch_keys[i].cast<std::string>();
+                                if (chunk_count == 1 || key == failed_key) {
+                                    recordDuplicateRequestId(task.ids[chunk_begin + i], key, "capture batch admission");
+                                    break;
+                                }
+                            }
+                        }
                         throw CaptureFailure(FailureStage::STORE,
                                              FailureDisposition::REQUEST_ERROR,
                                              "TorchSpec hidden-state store rejected duplicate request keys for batch ["
@@ -1480,12 +1663,12 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                                              + "] with an unknown exception");
                 }
 
-                if (fatal_failed_.load(std::memory_order_acquire)) {
+                if (!task.has_receipts && fatal_failed_.load(std::memory_order_acquire)) {
                     return;
                 }
                 // A malformed reply is not the host store's documented acceptance receipt.
                 const auto disposition = batch_stage ? FailureDisposition::HARD_CONTRACT : FailureDisposition::FATAL;
-                const auto context = "invalid EagleMooncakeStore.put_batch() metadata for batch [" + chunk_id + "]";
+                const auto context = "invalid capture store put_batch() metadata for batch [" + chunk_id + "]";
                 const auto status = perform(FailureStage::STORE, disposition, context.c_str(), [&]() -> absl::Status {
                     if (!py::isinstance<py::list>(acceptance) || py::len(acceptance) != static_cast<py::ssize_t>(chunk_count)) {
                         return absl::InvalidArgumentError("expected one accepted metadata item per chunk request");
@@ -1530,6 +1713,14 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                                    /*message_classified=*/true);
                     return;
                 }
+                if (task.has_receipts) {
+                    // File put_batch returns only after linking these exact keys. This fact survives
+                    // a later fatal device fence; quota/unsafe buffers still follow normal quarantine.
+                    task.committed_prefix = chunk_begin + chunk_count;
+                    if (fatal_failed_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                }
                 metrics.store_put_latency_us += autil::TimeUtility::currentTimeInMicroSeconds() - store_put_start_us;
                 store_put_latency_completed  = true;
                 admit_scope.reset();
@@ -1552,6 +1743,9 @@ void HiddenStateCapturePublisher::publishOnWorker(PublishTask& task) {
                                                      });
                 if (fatal_failed_.load(std::memory_order_acquire)) {
                     return;
+                }
+                if (trace_mark_) {
+                    markTrace("publisher.flush_return", batch_keys, traceTimeNs());
                 }
                 task.store_flushed = true;
                 if (!flush_succeeded) {
@@ -1606,7 +1800,9 @@ bool HiddenStateCapturePublisher::trySubmit(torch::Tensor        packed_hidden_s
                                             const torch::Tensor& input_lengths,
                                             const torch::Tensor& request_ids,
                                             int64_t              expected_rows,
-                                            const std::string&   layout_context) {
+                                            const std::string&   layout_context,
+                                            bool&                strict_file_backpressure) {
+    strict_file_backpressure = false;
     if (!owner_ || !capture_enabled_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -1721,6 +1917,10 @@ bool HiddenStateCapturePublisher::trySubmit(torch::Tensor        packed_hidden_s
         if (!task->dropped) {
             try {
                 pending_.push_back(task);
+                if (trace_enabled_) {
+                    task->submit_ns = traceTimeNs();
+                    task->submit_tid = gettid();
+                }
             } catch (const std::bad_alloc&) {
                 task->dropped = true;
             }
@@ -1735,10 +1935,12 @@ bool HiddenStateCapturePublisher::trySubmit(torch::Tensor        packed_hidden_s
         task->quota_bytes += extra;
         for (const auto request_id : task->ids) {
             auto& reservation     = reservations_.at(request_id);
+            task->has_receipts |= static_cast<bool>(reservation.receipt);
             reservation.submitted = true;
             reservation.task      = task;
         }
         state_changed_.notify_all();
+        strict_file_backpressure = task->dropped && task->has_receipts;
         return !task->dropped;
     } catch (const c10::OutOfMemoryError& error) {
         // Only capture-private host snapshots: no event, queue entry or ledger mutation.
@@ -1771,7 +1973,8 @@ bool HiddenStateCapturePublisher::flushStore(FailureStage stage) {
     if (fatal_failed_.load(std::memory_order_acquire)) {
         return false;
     }
-    if (!owner_ || !store_ || store_.is_none()) {
+    // FileCaptureStore.put_batch commits inline and never retains payloads, even on a partial failure.
+    if (!owner_ || !store_ || store_.is_none() || !file_store_dir_.empty()) {
         return true;
     }
     RTP_LLM_PROFILE_SCOPE("hidden_state_capture.flush");
@@ -1794,8 +1997,11 @@ void HiddenStateCapturePublisher::releaseLocalPayloads(PublishTask& task) {
     task.request_ids   = torch::Tensor();
     task.ready.reset();
     task.worker_stream.reset();
-    std::vector<int64_t>().swap(task.ids);
     std::lock_guard<std::mutex> lock(state_mutex_);
+    if (task.has_receipts) {
+        settleFileReceiptsLocked(task, false);
+    }
+    std::vector<int64_t>().swap(task.ids);
     for (auto entry = reservations_.begin(); entry != reservations_.end();) {
         if (entry->second.task.get() == &task && !entry->second.put_attempted) {
             auto released = entry++;
@@ -1865,7 +2071,7 @@ bool HiddenStateCapturePublisher::pollSourceKeys(void (*before_first_key_copy)()
         }
         processTask(task);
     }
-    if (fatal_failed_.load(std::memory_order_acquire)) {
+    if (!file_store_dir_.empty() || fatal_failed_.load(std::memory_order_acquire)) {
         return true;
     }
 
@@ -1995,10 +2201,45 @@ bool HiddenStateCapturePublisher::pollSourceKeys(void (*before_first_key_copy)()
     return true;
 }
 
+void HiddenStateCapturePublisher::abandonFileReceiptsLocked() noexcept {
+    for (auto& entry : reservations_) {
+        if (!active_file_task_ || entry.second.task != active_file_task_) {
+            entry.second.receipt.reset();  // broken_promise: publication is unconfirmed.
+        }
+    }
+}
+
+void HiddenStateCapturePublisher::settleFileReceiptsLocked(PublishTask& task, bool fatal) {
+    for (size_t i = 0; i < task.ids.size(); ++i) {
+        auto receipt = std::move(reservations_.at(task.ids[i]).receipt);
+        if (!receipt) {
+            continue;
+        }
+        if (task.succeeded || i < task.committed_prefix) {
+            receipt->set_value(FileCaptureResult::PUBLISHED);
+        } else if (fatal) {
+            receipt->set_value(FileCaptureResult::OWNER_FAILED);
+        } else {
+            receipt->set_value(task.dropped ? FileCaptureResult::QUEUE_FULL : FileCaptureResult::FAILED);
+        }
+    }
+}
+
+// Until put_batch returns, a concurrent fatal cannot know which keys were linked.
+void HiddenStateCapturePublisher::retireActiveFileTaskLocked() {
+    if (active_file_task_ && fatal_failed_.load(std::memory_order_acquire)) {
+        settleFileReceiptsLocked(*active_file_task_, true);
+    }
+    active_file_task_.reset();
+}
+
 void HiddenStateCapturePublisher::quarantineResources() noexcept {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (quarantine_ && !reservations_.empty()) {
+            if (!file_store_dir_.empty()) {
+                abandonFileReceiptsLocked();
+            }
             quarantined_samples_ = static_cast<int64_t>(reservations_.size());
             quarantined_bytes_   = reserved_bytes_;
             quarantined_tokens_  = reserved_tokens_;
@@ -2011,7 +2252,8 @@ void HiddenStateCapturePublisher::quarantineResources() noexcept {
     // release() transfers the live refcount without touching Python, so this
     // emergency path is also safe outside the GIL.
     (void)store_.release();
-    (void)mooncake_config_.release();
+    (void)trace_mark_.release();
+    (void)key_provider_.release();
     (void)quantize_fn_.release();
     (void)host_buffer_too_small_type_.release();
     try {
@@ -2064,6 +2306,9 @@ void HiddenStateCapturePublisher::processTask(const std::shared_ptr<PublishTask>
             {
                 task->ready->synchronize();
             }
+        }
+        if (trace_enabled_ && first_attempt) {
+            task->producer_ready_ns = traceTimeNs();
         }
         if (fatal_failed_.load(std::memory_order_acquire)) {
             return;
@@ -2139,7 +2384,7 @@ void HiddenStateCapturePublisher::processTask(const std::shared_ptr<PublishTask>
             return;
         }
 #if USING_CUDA || USING_ROCM
-        if (!task->local_fenced && task->store_attempted && !task->succeeded
+        if (file_store_dir_.empty() && !task->local_fenced && task->store_attempted && !task->succeeded
             && (put_batch_capacity_ == 0 || isCaptureRuntimeDevice(task->packed.device().type()))) {
             // GPU Direct stages on the store's setup device, even for a CPU source.
             const int device = put_batch_capacity_ == 0 ? local_rank_ : task->packed.device().index();
@@ -2218,6 +2463,7 @@ void HiddenStateCapturePublisher::workerLoop() noexcept {
             std::shared_ptr<PublishTask> task;
             {
                 std::unique_lock<std::mutex> lock(state_mutex_);
+                retireActiveFileTaskLocked();
                 worker_active_ = false;
                 state_changed_.notify_all();
                 state_changed_.wait_until(lock,
@@ -2227,6 +2473,12 @@ void HiddenStateCapturePublisher::workerLoop() noexcept {
                 if (!pending_.empty()) {
                     task = std::move(pending_.front());
                     pending_.pop_front();
+                    if (task->has_receipts) {
+                        active_file_task_ = task;
+                    }
+                    if (trace_enabled_) {
+                        task->dequeue_ns = traceTimeNs();
+                    }
                 } else if (stopping_ && !cleanup_requested) {
                     break;
                 }
@@ -2253,6 +2505,7 @@ void HiddenStateCapturePublisher::workerLoop() noexcept {
     }
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        retireActiveFileTaskLocked();
         worker_active_   = false;
         worker_finished_ = true;
     }
@@ -2273,6 +2526,14 @@ void HiddenStateCapturePublisher::flushAndClose() noexcept {
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
                 stopping_ = true;
+                if (!file_store_dir_.empty()) {
+                    for (auto& entry : reservations_) {
+                        if (auto& receipt = entry.second.receipt; receipt && !entry.second.submitted) {
+                            receipt->set_value(FileCaptureResult::STOPPED);
+                            receipt.reset();
+                        }
+                    }
+                }
             }
             state_changed_.notify_all();
             if (worker_.joinable()) {
@@ -2374,7 +2635,9 @@ void HiddenStateCapturePublisher::flushAndClose() noexcept {
                     return;
                 }
                 try {
-                    store_.attr("close")();
+                    if (file_store_dir_.empty()) {
+                        store_.attr("close")();
+                    }
                 } catch (const py::error_already_set& error) {
                     drained = false;
                     completeFailure(error, FailureStage::SHUTDOWN, "publisher shutdown close");
@@ -2421,11 +2684,14 @@ void HiddenStateCapturePublisher::flushAndClose() noexcept {
                     reserved_bytes_  = 0;
                     reserved_tokens_ = 0;
                 }
+                trace_mark_ = py::object();
                 store_ = py::object();
                 quantize_fn_     = py::object();
                 host_buffer_too_small_type_ = py::object();
-                mooncake_config_ = py::object();
+                key_provider_ = py::object();
             }
+        } else if (!file_store_dir_.empty()) {
+            quarantineResources();  // No interpreter to confirm or safely retire remaining work.
         }
         recordQuota(true);  // Final post-join state, outside state_mutex_ and any store operation.
 

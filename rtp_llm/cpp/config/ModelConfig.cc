@@ -223,6 +223,11 @@ std::string ModelConfig::to_string() const {
     }
     oss << "]\n"
         << "hidden_state_capture_dtype: " << hiddenStateCaptureDtypeToString(hidden_state_capture_dtype) << "\n"
+        << "hidden_state_capture_storage_dir: " << hidden_state_capture_storage.storage_dir.value_or("<env>") << "\n"
+        << "hidden_state_capture_io_workers: " << hidden_state_capture_storage.io_workers << "\n"
+        << "hidden_state_capture_io_depth: " << hidden_state_capture_storage.io_depth << "\n"
+        << "hidden_state_capture_compression: " << hidden_state_capture_storage.compression << "\n"
+        << "hidden_state_capture_compression_level: " << hidden_state_capture_storage.compression_level << "\n"
         << "hidden_state_capture_max_inflight_samples: " << hidden_state_capture_max_inflight_samples << "\n"
         << "hidden_state_capture_max_inflight_bytes: " << hidden_state_capture_max_inflight_bytes << "\n"
         << "hidden_state_capture_max_inflight_tokens: " << hidden_state_capture_max_inflight_tokens << "\n"

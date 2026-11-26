@@ -458,7 +458,7 @@ bool PyWrappedModel::shouldCaptureHiddenStates(const GptModelInputs& inputs) {
 }
 
 HiddenStateCaptureAdmissionResult PyWrappedModel::tryReserveHiddenStateCapture(int64_t request_id,
-                                                                               int64_t valid_tokens) {
+                                                                               int64_t valid_tokens, bool strict) {
     if (!hidden_state_capture_publisher_) {
         if (hidden_state_capture_metrics_reporter_) {
             RtpLLMHiddenStateCaptureMetricsCollector collector;
@@ -472,7 +472,7 @@ HiddenStateCaptureAdmissionResult PyWrappedModel::tryReserveHiddenStateCapture(i
                                                                      hidden_state_capture_initialization_error_};
     }
     try {
-        return hidden_state_capture_publisher_->tryReserve(request_id, valid_tokens);
+        return hidden_state_capture_publisher_->tryReserve(request_id, valid_tokens, strict);
     } catch (const std::bad_alloc&) {
         // tryReserve's generation-bound token rolls back its own insertion. An
         // ID-only discard here could cancel another generation's reservation.
@@ -1439,6 +1439,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                     try {
                         auto host_lengths = device_props_.enable_prefill_cp && has_context_request ?
                             cp_params.prefill_actual_input_lengths_cpu : captureHostLengths(inputs.input_lengths);
+                        bool strict_file_backpressure;
                         if (!host_lengths.defined()) {
                             reason = "capture OOM";
                             hidden_state_capture_publisher_->rejectRequest(reason, /*operational=*/true);
@@ -1448,10 +1449,12 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                                                                                host_lengths,
                                                                                inputs.request_id,
                                                                                capture_expected_rows,
-                                                                               capture_layout_context)) {
-                            // A queue-full drop is already submitted. discardReserved only
-                            // releases unsubmitted entries; never reclaim worker-owned storage.
-                            capture_outcome = discardHiddenStateCapture(inputs, "capture publication was not admitted");
+                                                                               capture_layout_context,
+                                                                               strict_file_backpressure)) {
+                            // A dropped file task already owns the producer fence; do not discard by ID.
+                            capture_outcome = strict_file_backpressure ?
+                                ErrorInfo{ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "file capture queue full"} :
+                                discardHiddenStateCapture(inputs, "capture publication was not admitted");
                         }
                     } catch (...) {
                         owner_error = std::current_exception();

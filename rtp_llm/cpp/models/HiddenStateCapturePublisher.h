@@ -32,7 +32,7 @@ struct HiddenStateCaptureStats {
     uint64_t broken_rejection_count{0};
 };
 
-// Per-owner quota lasts until local completion AND confirmed source-key removal.
+// Per-owner quota lasts until local completion; Mooncake also requires confirmed source-key removal.
 // Bytes include retained packed source, IDs, request metadata and store tensors.
 // Allocator/container overhead, transient
 // quantization workspace and store-internal staging require extra headroom.
@@ -56,13 +56,14 @@ public:
                                 int                          local_rank,
                                 kmonitor::MetricsReporterPtr metrics_reporter,
                                 HiddenStateCaptureLimits     limits               = {},
-                                std::vector<int64_t>         layer_ids            = {});
+                                std::vector<int64_t>         layer_ids            = {},
+                                HiddenStateCaptureStorageConfig storage = {});
     ~HiddenStateCapturePublisher();
 
     HiddenStateCapturePublisher(const HiddenStateCapturePublisher&)            = delete;
     HiddenStateCapturePublisher& operator=(const HiddenStateCapturePublisher&) = delete;
 
-    HiddenStateCaptureAdmissionResult tryReserve(int64_t request_id, int64_t valid_tokens);
+    HiddenStateCaptureAdmissionResult tryReserve(int64_t request_id, int64_t valid_tokens, bool strict = false);
     int64_t                          inflightSamples() const;
     int64_t                          inflightBytes() const;
     // Only the current synchronous model forward may discard by request ID.
@@ -98,7 +99,8 @@ public:
                    const torch::Tensor& input_lengths,
                    const torch::Tensor& request_ids,
                    int64_t              expected_rows,
-                   const std::string&   layout_context);
+                   const std::string&   layout_context,
+                   bool&                strict_file_backpressure);
 
     // Only a delivery-owner <key>_abandoned marker permits producer reclamation,
     // after local completion and native PUT drain. Normal live data is never deleted.
@@ -143,6 +145,7 @@ private:
         std::string                  base_key;
         std::vector<std::string>     keys;
         std::shared_ptr<PutAttempt>  put_attempted;
+        std::unique_ptr<std::promise<FileCaptureResult>> receipt;
     };
 
     struct LifetimeQuarantine {
@@ -173,9 +176,11 @@ private:
         bool    has_store_put_latency{false};
     };
 
-    void cancelReserved(int64_t request_id, std::optional<uint64_t> generation);
+    void cancelReserved(int64_t request_id, std::optional<uint64_t> generation, FileCaptureResult outcome = FileCaptureResult::CANCELLED);
     bool rejectFailure(std::string error_message, FailureStage failure_stage, FailureDisposition failure_disposition);
     void initialize(int local_rank);
+    void initializeStore(int local_rank);
+    void markTrace(const char* name, const pybind11::list& keys, int64_t ts_ns, int64_t origin_tid = 0) const;
     void workerLoop() noexcept;
     void processTask(const std::shared_ptr<PublishTask>& task);
     bool payloadBytes(int64_t tokens, int64_t& bytes, int64_t* store_bytes = nullptr) const;
@@ -186,6 +191,9 @@ private:
     pybind11::dict querySourceKeys(const std::vector<std::string>& keys);
     bool          pollSourceKeys(void (*before_first_key_copy)() = nullptr);  // False on local snapshot allocation failure.
     void quarantineResources() noexcept;
+    void abandonFileReceiptsLocked() noexcept;
+    void settleFileReceiptsLocked(PublishTask& task, bool fatal);
+    void retireActiveFileTaskLocked();
     void publishOnWorker(PublishTask& task);
     std::string makeRequestKey(int64_t request_id) const;
     std::string makeBatchId(uint64_t batch_sequence, int64_t first_request_id, int64_t last_request_id) const;
@@ -216,6 +224,9 @@ private:
     const HiddenStateCaptureDtype capture_dtype_;
     const c10::ScalarType         model_dtype_;
     const bool                    owner_;
+    const HiddenStateCaptureStorageConfig storage_;
+    const std::string             file_store_dir_;
+    const bool                    trace_enabled_;
     std::string                   store_key_namespace_;
     kmonitor::MetricsReporterPtr  metrics_reporter_;
     KmonStatusMetricPtr           capture_enabled_metric_;
@@ -244,6 +255,7 @@ private:
     std::condition_variable                    state_changed_;
     std::unordered_map<int64_t, Reservation>   reservations_;
     std::deque<std::shared_ptr<PublishTask>>   pending_;
+    std::shared_ptr<PublishTask>               active_file_task_;  // protected by state_mutex_
     int64_t                                    reserved_bytes_{0};
     int64_t                                    reserved_tokens_{0};
     // Retained resource snapshot, separate from the active reservation ledger.
@@ -262,11 +274,12 @@ private:
     std::thread                         worker_;
     std::unique_ptr<LifetimeQuarantine> quarantine_;
 
-    // Setup creates exactly async_put_pool_size host leases. Zero is used only
-    // for the synchronous GPU Direct send path, which needs no host lease limit.
+    // Positive only for the Mooncake host lease pool. Zero passes the full batch
+    // to GPU Direct or FileCaptureStore (which bounds its own pipeline).
     int64_t          put_batch_capacity_{0};
-    pybind11::object mooncake_config_;
+    pybind11::object key_provider_;  // MooncakeConfig instance or the RTP file contract module.
     pybind11::object store_;
+    pybind11::object trace_mark_;
     pybind11::object quantize_fn_;
     pybind11::object host_buffer_too_small_type_;
 };

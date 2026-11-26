@@ -33,6 +33,7 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+constexpr int64_t kFileReceiptCancelPollMs = 10;
 constexpr int64_t kRpcOutputWaitTimeoutMs        = 500;
 constexpr size_t  kAllocatorDumpReplayHistoryMax = 1024;
 
@@ -348,11 +349,45 @@ LocalRpcServer::serializeErrorMsg(const string& request_key, const RequestInfo& 
     }
 }
 
+ErrorInfo LocalRpcServer::pollFilePublication(grpc::ServerContext* context, const GenerateStreamPtr& stream,
+                                              int64_t wait_ms, int64_t admission_deadline_ms) const {
+    const auto* receipt = stream->fileCapturePublication();
+    const auto remaining = [&]() {
+        auto ms = std::min(stream->deadlineMs(), admission_deadline_ms) - currentTimeMs();
+        if (context && context->deadline() != std::chrono::system_clock::time_point::max()) {
+            ms = std::min<int64_t>(ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                context->deadline() - std::chrono::system_clock::now()).count());
+        }
+        return ms;
+    };
+    const auto left = remaining();
+    const bool ready = receipt->wait_for(std::chrono::milliseconds(std::max<int64_t>(0, std::min(left, wait_ms))))
+                       == std::future_status::ready;
+    if (remaining() <= 0) {
+        return {ErrorCode::GENERATE_TIMEOUT, "file capture publication deadline exceeded"};
+    }
+    if (isCancelled(context)) {
+        return {ErrorCode::CANCELLED, "file capture request cancelled"};
+    }
+    if (stream->hasError()) {
+        return stream->statusInfo();
+    }
+    if (!ready) {
+        return {ErrorCode::OUTPUT_QUEUE_NO_UPDATE, ""};
+    }
+    try {
+        return fileCaptureStatus(receipt->get());
+    } catch (const std::future_error&) {
+        return fileCaptureStatus(FileCaptureResult::OWNER_FAILED);
+    }
+}
+
 grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*                         context,
                                               const string&                                request_key,
                                               WriterInterface*                             writer,
                                               std::shared_ptr<GenerateStream>&             stream,
-                                              const std::function<FirstError::Snapshot()>& check_remote) {
+                                              const std::function<FirstError::Snapshot()>& check_remote,
+                                              int64_t admission_deadline_ms) {
     RTP_LLM_PROFILE_FUNCTION();
     // Observe local and remote failures before waiting for another token.
     // Decode replays the Prefill token into its queue even for non-streaming
@@ -365,6 +400,22 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*              
     bool        second_token_reported = false;
     const auto& config                = *stream->generateConfig();
     BatchStreamOutputCollector complete_output(config.aux_info ? config.logits_index : std::nullopt);
+    bool need_publication = stream->fileCapturePublication() != nullptr;
+    const auto await_publication = [&]() -> grpc::Status {
+        for (;;) {
+            auto status = pollFilePublication(context, stream, kFileReceiptCancelPollMs, admission_deadline_ms);
+            if (check_remote) {
+                auto remote = check_remote();
+                if (remote.error.hasError()) {
+                    return serializeErrorMsg(request_key, stream->generateInput()->request_info, remote.error);
+                }
+            }
+            if (status.code() != ErrorCode::OUTPUT_QUEUE_NO_UPDATE) {
+                need_publication = false;
+                return status.ok() ? grpc::Status::OK : serializeErrorMsg(request_key, stream->generateInput()->request_info, status);
+            }
+        }
+    };
     while (true) {
         auto remote_error = check_remote ? check_remote() : FirstError::Snapshot{};
         auto first        = FirstError::earlier(stream->firstError(), remote_error);
@@ -388,6 +439,9 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*              
                                              stream->generateInput()->request_info,
                                              ErrorInfo(ErrorCode::UNKNOWN_ERROR,
                                                        "non-streaming PD request finished without terminal output"));
+                }
+                if (need_publication) {
+                    return await_publication();
                 }
                 break;
             }
@@ -434,6 +488,14 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*              
         }
         // Measure the start of the write carrying the token, and only report accepted writes.
         const auto write_time_us = output_len > 0 ? currentTimeUs() : 0;
+        // Only the zero-token business output promises publication. Wait outside the stream lock,
+        // after packing, so cancellation and deadlines are observed at the transport boundary.
+        if (need_publication && !output.frontend_metric_only) {
+            auto status = await_publication();
+            if (!status.ok()) {
+                return status;
+            }
+        }
         if (!writer->Write(outputs_pb)) {
             stream->reportError(ErrorCode::CANCELLED, "write outputs pb failed");
             RTP_LLM_LOG_WARNING("request [%s] write outputs pb failed", request_key.c_str());
@@ -738,7 +800,8 @@ grpc::Status LocalRpcServer::generateLocalStream(grpc::ServerContext*   context,
     RTP_LLM_LOG_DEBUG("request [%ld] enqueue success", request_id);
 
     generate_context.error_status =
-        pollStreamOutput(context, generate_context.request_key, writer, generate_context.getStream());
+        pollStreamOutput(context, generate_context.request_key, writer, generate_context.getStream(), {},
+                         cancel_handle ? cancel_handle->deadline_ms : INT64_MAX);
     if (generate_context.hasError() && generate_context.getStream() && generate_context.getStream()->hasError()) {
         generate_context.error_info = generate_context.getStream()->statusInfo();
     }
@@ -946,6 +1009,23 @@ grpc::Status LocalRpcServer::generateLocalBatch(grpc::ServerContext*        cont
         // collectStreamOutput is currently SERIAL: streams[0] must finish before streams[1] is drained.
         // For batch decode this is bounded (all streams advance together), but TODO: parallelize for
         // mixed-length batches.
+        std::vector<int> pending_publications;
+        const auto poll_publication = [&](int i, int64_t wait_ms = 0) {
+            return pollFilePublication(context, streams[i], wait_ms,
+                                       cancel_handles[i] ? cancel_handles[i]->deadline_ms : INT64_MAX);
+        };
+        const auto finish_item = [&](int i, const ErrorInfo& err) {
+            const char* error_type = err.ok() ? nullptr : (err.code() == ErrorCode::CANCELLED ? "Cancelled" : "BusinessError");
+            if (!err.ok()) {
+                mark_item_error(i, err.code(), "Batch request failed", error_type);
+                auto* result = response->mutable_results(i);
+                result->clear_final_output();
+                auto* error = result->mutable_error_info();
+                error->set_error_code(transErrorCodeToRPC(err.code()));
+                error->set_error_message(err.ToString());
+            }
+            recordBatchItemCompletion(item_guard(i), streams[i], *inputs[i], err.ok(), error_type);
+        };
         for (int i = 0; i < (int)streams.size(); i++) {
             if (admission_errors[i].ok() && !streams[i]) {
                 throw std::runtime_error("enqueueMultiple returned a null stream at index " + std::to_string(i));
@@ -971,14 +1051,7 @@ grpc::Status LocalRpcServer::generateLocalBatch(grpc::ServerContext*        cont
             GenerateOutputs last_outputs;
             auto            err = collectStreamOutput(context, streams[i], inputs[i], last_outputs);
             stream_cleanup_guard.markHandled(static_cast<size_t>(i));
-            const char* error_type =
-                err.ok() ? nullptr : (err.code() == ErrorCode::CANCELLED ? "Cancelled" : "BusinessError");
-            if (!err.ok()) {
-                mark_item_error(i, err.code(), "Batch request failed", error_type);
-                auto* err_pb = result->mutable_error_info();
-                err_pb->set_error_code(transErrorCodeToRPC(err.code()));
-                err_pb->set_error_message(err.ToString());
-            } else {
+            if (err.ok()) {
                 auto* output_pb = result->mutable_final_output();
                 QueryConverter::transResponse(output_pb,
                                               &last_outputs,
@@ -986,7 +1059,31 @@ grpc::Status LocalRpcServer::generateLocalBatch(grpc::ServerContext*        cont
                                               maga_init_params_.misc_config.aux_string,
                                               streams[i]->specialTokens().eos_token_id);
             }
-            recordBatchItemCompletion(item_guard(i), streams[i], *inputs[i], err.ok(), error_type);
+            if (err.ok() && streams[i]->fileCapturePublication()) {
+                err = poll_publication(i);
+                if (err.code() == ErrorCode::OUTPUT_QUEUE_NO_UPDATE) {
+                    pending_publications.push_back(i);
+                    continue;
+                }
+            }
+            finish_item(i, err);
+        }
+        // A slow file cannot prevent collection or settlement of another item. The protobuf
+        // is private to this handler until return; never return a provisional final_output.
+        while (!pending_publications.empty()) {
+            const auto wait_ms = pending_publications.size() == 1 ? kFileReceiptCancelPollMs : 0;
+            auto done = std::remove_if(pending_publications.begin(), pending_publications.end(), [&](int i) {
+                auto status = poll_publication(i, wait_ms);
+                if (status.code() == ErrorCode::OUTPUT_QUEUE_NO_UPDATE) {
+                    return false;
+                }
+                finish_item(i, status);
+                return true;
+            });
+            pending_publications.erase(done, pending_publications.end());
+            if (pending_publications.size() > 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
 
         stream_cleanup_guard.dismiss();

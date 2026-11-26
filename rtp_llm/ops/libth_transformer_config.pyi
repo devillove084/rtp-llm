@@ -1091,6 +1091,11 @@ class ModelConfig:
     has_pre_decoder_layernorm: bool
     hidden_size: int
     hidden_state_capture_dtype: HiddenStateCaptureDtype
+    hidden_state_capture_storage_dir: str | None
+    hidden_state_capture_io_workers: int
+    hidden_state_capture_io_depth: int
+    hidden_state_capture_compression: str
+    hidden_state_capture_compression_level: int
     hidden_state_capture_layer_ids: list[int]
     hidden_state_capture_max_inflight_samples: int
     hidden_state_capture_max_inflight_bytes: int

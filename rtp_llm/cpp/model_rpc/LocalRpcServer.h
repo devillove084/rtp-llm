@@ -128,11 +128,15 @@ protected:
     grpc::Status serializeErrorMsg(const std::string& request_key, ErrorInfo error_info);
     grpc::Status
     serializeErrorMsg(const std::string& request_key, const RequestInfo& request_info, ErrorInfo error_info);
+    // Only called for an admitted strict file reservation. A zero wait is a batch readiness probe.
+    ErrorInfo pollFilePublication(grpc::ServerContext* context, const GenerateStreamPtr& stream, int64_t wait_ms,
+                                  int64_t admission_deadline_ms = INT64_MAX) const;
     grpc::Status pollStreamOutput(grpc::ServerContext*                         context,
                                   const std::string&                           request_key,
                                   WriterInterface*                             writer,
                                   std::shared_ptr<GenerateStream>&             stream,
-                                  const std::function<FirstError::Snapshot()>& check_remote = {});
+                                  const std::function<FirstError::Snapshot()>& check_remote = {},
+                                  int64_t admission_deadline_ms = INT64_MAX);
     // Preserve input order and settle each admitted stream independently.
     grpc::Status pollBatchStreamOutput(grpc::ServerContext* context,
                                        const std::vector<GenerateStreamPtr>& streams,

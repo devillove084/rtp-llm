@@ -366,7 +366,7 @@ protected:
     class OneSlotModel: public MockModel {
     public:
         using MockModel::MockModel;
-        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t id, int64_t) override {
+        HiddenStateCaptureAdmissionResult tryReserveHiddenStateCapture(int64_t id, int64_t, bool = false) override {
             requests.push_back(id);
             if (auto held = slot.lock(); held && held->active()) {
                 return {ErrorCode::HIDDEN_STATE_CAPTURE_BACKPRESSURE, "capture slot occupied"};

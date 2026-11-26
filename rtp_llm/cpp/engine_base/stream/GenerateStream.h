@@ -167,6 +167,11 @@ public:
     bool isHiddenStateCaptureCandidate() const;
     bool canExecuteReservedHiddenStateCapture() const;
     bool hasHiddenStateCaptureReservation() const;
+    // Immutable after admission; releasing KV/unsubmitted quota does not revoke a submitted receipt.
+    const std::shared_future<FileCaptureResult>* fileCapturePublication() const {
+        return hidden_state_capture_reservation_ && hidden_state_capture_reservation_->publication().valid() ?
+                   &hidden_state_capture_reservation_->publication() : nullptr;
+    }
     // Installed before scheduling; a non-owner marker is not publisher admission.
     void setHiddenStateCaptureReservation(HiddenStateCaptureReservationPtr reservation, bool owns_admission = true);
     // Rejection before scheduling, executor-side failure, or final resource release only.

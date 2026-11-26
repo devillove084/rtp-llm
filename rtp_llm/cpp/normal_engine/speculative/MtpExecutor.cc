@@ -65,11 +65,11 @@ bool pythonDraftSupportsMtpIndexerShare(const py::object& py_model) {
     }
 }
 
-HiddenStateCaptureAdmissionResult MtpExecutor::tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens) {
+HiddenStateCaptureAdmissionResult MtpExecutor::tryReserveHiddenStateCapture(int64_t request_id, int64_t valid_tokens, bool strict) {
     if (!model_) {
         return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture target model is unavailable"};
     }
-    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens);
+    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens, strict);
 }
 
 ServingDeviceHealthPtr MtpExecutor::servingDeviceHealth() const {
@@ -817,6 +817,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     model_init_params.hidden_state_capture_layer_ids = selectHiddenStateCaptureLayerIds(
         HiddenStateCaptureModelRole::TARGET, role_type_, warm_up_, params.model_config_.hidden_state_capture_layer_ids);
     model_init_params.hidden_state_capture_dtype = params.model_config_.hidden_state_capture_dtype;
+    model_init_params.hidden_state_capture_storage = params.model_config_.hidden_state_capture_storage;
     model_init_params.hidden_state_capture_max_inflight_samples =
         params.model_config_.hidden_state_capture_max_inflight_samples;
     model_init_params.hidden_state_capture_max_inflight_bytes =
@@ -910,6 +911,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                              warm_up_,
                                              mtp_params->model_config_.hidden_state_capture_layer_ids);
         model_params.hidden_state_capture_dtype = mtp_params->model_config_.hidden_state_capture_dtype;
+        model_params.hidden_state_capture_storage = mtp_params->model_config_.hidden_state_capture_storage;
 #if USING_CUDA || USING_ROCM
         if (params.hw_kernel_config.enable_cuda_graph && model_params.kv_cache_layer_layout.has_value()) {
             const auto& topology = model_params.kv_cache_layer_layout->topology();

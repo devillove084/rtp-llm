@@ -60,11 +60,11 @@ NormalExecutor::~NormalExecutor() {
 }
 
 HiddenStateCaptureAdmissionResult NormalExecutor::tryReserveHiddenStateCapture(int64_t request_id,
-                                                                               int64_t valid_tokens) {
+                                                                               int64_t valid_tokens, bool strict) {
     if (!model_) {
         return {ErrorCode::EXECUTION_EXCEPTION, "hidden-state capture model is unavailable"};
     }
-    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens);
+    return model_->tryReserveHiddenStateCapture(request_id, valid_tokens, strict);
 }
 
 ServingDeviceHealthPtr NormalExecutor::servingDeviceHealth() const {
@@ -199,6 +199,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
         model_init_params.hidden_state_capture_layer_ids.clear();
     }
     model_init_params.hidden_state_capture_dtype = params.model_config_.hidden_state_capture_dtype;
+    model_init_params.hidden_state_capture_storage = params.model_config_.hidden_state_capture_storage;
     model_init_params.hidden_state_capture_max_inflight_samples =
         params.model_config_.hidden_state_capture_max_inflight_samples;
     model_init_params.hidden_state_capture_max_inflight_bytes =

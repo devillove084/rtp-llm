@@ -185,6 +185,7 @@ py_library(
         ":jit_cache_env",
         ":torch",
         ":safetensors",
+        ":zstandard",
         #":decord",
         ":lru-dict",
         ":cpm_kernels",

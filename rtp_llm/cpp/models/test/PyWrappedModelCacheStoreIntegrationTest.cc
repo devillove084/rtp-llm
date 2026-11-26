@@ -2070,12 +2070,117 @@ runPyWrappedModelSpeculativeCommitBridge(py::object py_model, const std::string&
 }  // namespace
 }  // namespace rtp_llm::test
 
-PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
+namespace {
+void registerCapturePublisher(py::module_& m) {
     // Serving status is process-wide. Keep it active across worker reports and
     // borrowed reporter snapshots, including standalone Python-owned publishers.
     rtp_llm::startKmonServiceStatus(nullptr);
     rtp_llm::setKmonServiceServing(true);
     m.add_object("_kmon_service_status", py::capsule(&rtp_llm::stopKmonServiceStatus));
+    using Publisher   = rtp_llm::HiddenStateCapturePublisher;
+    using Reservation = rtp_llm::HiddenStateCaptureReservation;
+    using Peer        = rtp_llm::test::PyWrappedModelTestPeer;
+    py::class_<Reservation, rtp_llm::HiddenStateCaptureReservationPtr>(m, "CaptureReservation")
+        .def("cancel", &Reservation::cancel, py::call_guard<py::gil_scoped_release>())
+        .def("publication", [](const Reservation& reservation) -> py::object {
+            const auto& future = reservation.publication();
+            if (!future.valid()) { return py::none(); }
+            if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { return py::str("pending"); }
+            const auto status = fileCaptureStatus(future.get());
+            return py::make_tuple(static_cast<int>(status.code()), status.ToString());
+        })
+        .def_property_readonly("active", &Reservation::active);
+    using Admission = rtp_llm::HiddenStateCaptureAdmissionResult;
+    py::class_<Admission>(m, "CaptureAdmission")
+        .def_property_readonly("ok", &Admission::ok)
+        .def_property_readonly("code", [](const Admission& result) { return static_cast<int>(result.status().code()); })
+        .def_property_readonly("message", [](const Admission& result) { return result.status().ToString(); })
+        .def_property_readonly("reservation", [](const Admission& result) { return result.value(); });
+    py::class_<Publisher>(m, "CapturePublisher")
+        .def(py::init([](int64_t            samples,
+                         int64_t            bytes,
+                         int64_t            tokens,
+                         int64_t            batches,
+                         const std::string& model_dtype,
+                         bool                       fp8,
+                         const std::vector<int64_t>& layer_ids,
+                         int64_t                    poll_interval_ms,
+                         std::optional<std::string> storage_dir, int64_t io_workers, int64_t io_depth,
+                         std::string compression, int64_t compression_level) {
+                 rtp_llm::HiddenStateCaptureLimits limits{samples, bytes, tokens, batches, poll_interval_ms};
+                 auto                              dtype = torch::kFloat16;
+                 if (model_dtype == "bfloat16")
+                     dtype = torch::kBFloat16;
+                 else if (model_dtype == "float32")
+                     dtype = torch::kFloat32;
+                 else if (model_dtype == "float64")
+                     dtype = torch::kFloat64;
+                 else if (model_dtype != "float16")
+                     throw std::invalid_argument("unsupported test model dtype");
+                 return std::make_unique<Publisher>(2,
+                                                    1,
+                                                    fp8 ? rtp_llm::HiddenStateCaptureDtype::FP8_E4M3 :
+                                                          rtp_llm::HiddenStateCaptureDtype::BF16,
+                                                    dtype,
+                                                    true,
+                                                    0,
+                                                    std::make_shared<kmonitor::MetricsReporter>("", "", kmonitor::MetricsTags{}),
+                                                    limits,
+                                                    layer_ids,
+                                                    rtp_llm::HiddenStateCaptureStorageConfig{
+                                                        std::move(storage_dir), io_workers, io_depth,
+                                                        std::move(compression), compression_level});
+             }),
+             py::arg("samples")     = 64,
+             py::arg("bytes")       = 1073741824,
+             py::arg("tokens")      = 131072,
+             py::arg("batches")     = 8,
+             py::arg("model_dtype") = "float16",
+             py::arg("fp8")         = false,
+             py::arg("layer_ids")        = std::vector<int64_t>{0, 1},
+             py::arg("poll_interval_ms") = 1000, py::arg("storage_dir") = py::none(),
+             py::arg("io_workers") = 2, py::arg("io_depth") = 2,
+             py::arg("compression") = "none", py::arg("compression_level") = 1)
+        .def("metrics", [](Publisher& publisher) {
+            return rtp_llm::test::FakeMetricsReporter(Peer::captureMetricsReporter(publisher))
+                .snapshotHiddenStateCaptureMetrics();
+        })
+        .def("poll", &Peer::pollCapture)
+        .def("poll_with_key_copy_failure", &Peer::pollWithKeyCopyFailure)
+        .def("reservation_generation", &Peer::reservationGeneration)
+        .def("reserve", &Publisher::tryReserve, py::arg("request_id"), py::arg("valid_tokens"), py::arg("strict") = false)
+        .def("discard", &Publisher::discardReserved)
+        .def("submit", [](Publisher& publisher, torch::Tensor packed, const torch::Tensor& ids,
+                          const torch::Tensor& lengths, const torch::Tensor& requests, int64_t rows,
+                          const std::string& context) {
+            bool backpressure;
+            return publisher.trySubmit(std::move(packed), ids, lengths, requests, rows, context, backpressure);
+        })
+        .def(
+            "drain",
+            [](Publisher& publisher, int64_t timeout_ms) {
+                if (timeout_ms < 0) {
+                    throw std::invalid_argument("capture drain timeout must be nonnegative");
+                }
+                return Peer::waitCaptureDrain(publisher, std::chrono::milliseconds(timeout_ms));
+            },
+            py::arg("timeout_ms") = 10000)
+        .def("wait_stopping",
+             [](Publisher& publisher) { return Peer::waitCaptureStopping(publisher, std::chrono::seconds(10)); })
+        .def("close", &Publisher::flushAndClose)
+        .def_property_readonly("inflight_samples", &Publisher::inflightSamples)
+        .def_property_readonly("inflight_bytes", &Publisher::inflightBytes)
+        .def_property_readonly("diagnostic", &Publisher::diagnostic)
+        .def_property_readonly("fatal", [](const Publisher& publisher) { return publisher.fatalState().failed; });
+}
+}  // namespace
+
+PYBIND11_MODULE(libth_hidden_state_file_publisher_cpu_test, m) {
+    registerCapturePublisher(m);
+}
+
+PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
+    registerCapturePublisher(m);
     torch_ext::registerPyOpDefs(m);
     rtp_llm::registerExecCtxOps(m);
     m.def("make_native_lm_head",
@@ -2103,81 +2208,6 @@ PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
           py::arg("indexes"),
           py::arg("python_norm"),
           py::arg("compact_output") = false);
-    using Publisher   = rtp_llm::HiddenStateCapturePublisher;
-    using Reservation = rtp_llm::HiddenStateCaptureReservation;
-    using Peer        = rtp_llm::test::PyWrappedModelTestPeer;
-    py::class_<Reservation, rtp_llm::HiddenStateCaptureReservationPtr>(m, "CaptureReservation")
-        .def("cancel", &Reservation::cancel, py::call_guard<py::gil_scoped_release>())
-        .def_property_readonly("active", &Reservation::active);
-    using Admission = rtp_llm::HiddenStateCaptureAdmissionResult;
-    py::class_<Admission>(m, "CaptureAdmission")
-        .def_property_readonly("ok", &Admission::ok)
-        .def_property_readonly("code", [](const Admission& result) { return static_cast<int>(result.status().code()); })
-        .def_property_readonly("message", [](const Admission& result) { return result.status().ToString(); })
-        .def_property_readonly("reservation", [](const Admission& result) { return result.value(); });
-    py::class_<Publisher>(m, "CapturePublisher")
-        .def(py::init([](int64_t            samples,
-                         int64_t            bytes,
-                         int64_t            tokens,
-                         int64_t            batches,
-                         const std::string& model_dtype,
-                         bool                       fp8,
-                         const std::vector<int64_t>& layer_ids,
-                         int64_t                    poll_interval_ms) {
-                 rtp_llm::HiddenStateCaptureLimits limits{samples, bytes, tokens, batches, poll_interval_ms};
-                 auto                              dtype = torch::kFloat16;
-                 if (model_dtype == "bfloat16")
-                     dtype = torch::kBFloat16;
-                 else if (model_dtype == "float32")
-                     dtype = torch::kFloat32;
-                 else if (model_dtype == "float64")
-                     dtype = torch::kFloat64;
-                 else if (model_dtype != "float16")
-                     throw std::invalid_argument("unsupported test model dtype");
-                 return std::make_unique<Publisher>(2,
-                                                    1,
-                                                    fp8 ? rtp_llm::HiddenStateCaptureDtype::FP8_E4M3 :
-                                                          rtp_llm::HiddenStateCaptureDtype::BF16,
-                                                    dtype,
-                                                    true,
-                                                    0,
-                                                    std::make_shared<kmonitor::MetricsReporter>("", "", kmonitor::MetricsTags{}),
-                                                    limits,
-                                                    layer_ids);
-             }),
-             py::arg("samples")     = 64,
-             py::arg("bytes")       = 1073741824,
-             py::arg("tokens")      = 131072,
-             py::arg("batches")     = 8,
-             py::arg("model_dtype") = "float16",
-             py::arg("fp8")         = false,
-             py::arg("layer_ids")        = std::vector<int64_t>{0, 1},
-             py::arg("poll_interval_ms") = 1000)
-        .def("metrics", [](Publisher& publisher) {
-            return rtp_llm::test::FakeMetricsReporter(Peer::captureMetricsReporter(publisher))
-                .snapshotHiddenStateCaptureMetrics();
-        })
-        .def("poll", &Peer::pollCapture)
-        .def("poll_with_key_copy_failure", &Peer::pollWithKeyCopyFailure)
-        .def("reservation_generation", &Peer::reservationGeneration)
-        .def("reserve", &Publisher::tryReserve)
-        .def("submit", &Publisher::trySubmit)
-        .def(
-            "drain",
-            [](Publisher& publisher, int64_t timeout_ms) {
-                if (timeout_ms < 0) {
-                    throw std::invalid_argument("capture drain timeout must be nonnegative");
-                }
-                return Peer::waitCaptureDrain(publisher, std::chrono::milliseconds(timeout_ms));
-            },
-            py::arg("timeout_ms") = 10000)
-        .def("wait_stopping",
-             [](Publisher& publisher) { return Peer::waitCaptureStopping(publisher, std::chrono::seconds(10)); })
-        .def("close", &Publisher::flushAndClose)
-        .def_property_readonly("inflight_samples", &Publisher::inflightSamples)
-        .def_property_readonly("inflight_bytes", &Publisher::inflightBytes)
-        .def_property_readonly("diagnostic", &Publisher::diagnostic)
-        .def_property_readonly("fatal", [](const Publisher& publisher) { return publisher.fatalState().failed; });
     py::class_<rtp_llm::test::CaptureAtenProbe>(m, "CaptureAtenProbe")
         .def(py::init<>())
         .def("wait", &rtp_llm::test::CaptureAtenProbe::wait, py::arg("timeout_ms") = 10000)

@@ -222,6 +222,11 @@ class ModelConfig(CppModelConfig):
         "hidden_size",
         "hidden_state_capture_layer_ids",
         "hidden_state_capture_dtype",
+        "hidden_state_capture_storage_dir",
+        "hidden_state_capture_io_workers",
+        "hidden_state_capture_io_depth",
+        "hidden_state_capture_compression",
+        "hidden_state_capture_compression_level",
         "hidden_state_capture_max_inflight_samples",
         "hidden_state_capture_max_inflight_bytes",
         "hidden_state_capture_max_inflight_tokens",
@@ -856,7 +861,23 @@ class ModelConfig(CppModelConfig):
         """Apply model override arguments to ModelConfig.
 
         Args:
-            json_model_override_args: JSON string with model override arguments
+            json_model_override_args: JSON string with model override arguments.
+
+        For example, --json_model_override_args (or JSON_MODEL_OVERRIDE_ARGS) accepts::
+
+            {"hidden_state_capture_layer_ids": [7, 2], "hidden_state_capture_dtype": "bf16",
+             "hidden_state_capture_storage_dir": "/mnt/3fs/capture", "hidden_state_capture_io_workers": 2,
+             "hidden_state_capture_io_depth": 2, "hidden_state_capture_compression": "zstd",
+             "hidden_state_capture_compression_level": 1}
+
+        An unset storage directory inherits RTP_HIDDEN_STATE_CAPTURE_3FS_DIR; an
+        explicit empty string selects Mooncake even when that variable is set.
+        Workers and depth must be positive int64s (default 2 each); compression
+        is none (default) or zstd, level -131072..22 (default 1). Set process-wide
+        RTP_HIDDEN_STATE_CAPTURE_TRACE_DIR before startup for host tracing.
+        Layer selection and a nonempty ASCII-alphanumeric MOONCAKE_STORE_KEY_NAMESPACE
+        remain required. File keys use the numeric GenerateInput request_id,
+        not GenerateConfig.global_request_id or a correlation/trace ID.
         """
         model_override_args = json.loads(json_model_override_args)
         if not model_override_args:
@@ -903,20 +924,41 @@ class ModelConfig(CppModelConfig):
 
         # Per-owner finite payload limits, not temporary allocation headroom.
         # Defaults live in C++ ModelConfig; an empty capture layer list stays off.
-        capture_limits = {}
+        capture_options = {}
         for name in (
             "hidden_state_capture_max_inflight_samples",
             "hidden_state_capture_max_inflight_bytes",
             "hidden_state_capture_max_inflight_tokens",
             "hidden_state_capture_max_pending_batches",
             "hidden_state_capture_poll_interval_ms",
+            "hidden_state_capture_io_workers",
+            "hidden_state_capture_io_depth",
         ):
             if name not in model_override_args:
                 continue
             value = model_override_args[name]
             if type(value) is not int or not 0 < value <= 2**63 - 1:
                 raise ValueError(f"{name} must be a positive int64 integer")
-            capture_limits[name] = value
+            capture_options[name] = value
+
+        name = "hidden_state_capture_storage_dir"
+        if name in model_override_args:
+            value = model_override_args[name]
+            if not isinstance(value, str) or "\x00" in value:
+                raise ValueError(f"{name} must be a path string without NUL")
+            capture_options[name] = value
+        name = "hidden_state_capture_compression"
+        if name in model_override_args:
+            value = model_override_args[name]
+            if value not in ("none", "zstd"):
+                raise ValueError(f"{name} must be 'none' or 'zstd'")
+            capture_options[name] = value
+        name = "hidden_state_capture_compression_level"
+        if name in model_override_args:
+            value = model_override_args[name]
+            if type(value) is not int or not -131072 <= value <= 22:
+                raise ValueError(f"{name} must be an integer between -131072 and 22")
+            capture_options[name] = value
 
         # Apply only after all capture overrides have been validated so an
         # invalid later field cannot leave an earlier field partially updated.
@@ -925,7 +967,7 @@ class ModelConfig(CppModelConfig):
             self.hidden_state_capture_layer_ids = layer_ids
         if capture_dtype is not None:
             self.hidden_state_capture_dtype = capture_dtype
-        for name, value in capture_limits.items():
+        for name, value in capture_options.items():
             setattr(self, name, value)
 
     def init_precision_config(
